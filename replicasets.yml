@@ -5,6 +5,7 @@ router:
   - failover-coordinator
   - vshard-router
   - app.roles.custom
+  - app.roles.proxy
   all_rw: false
 s-1:
   instances:
