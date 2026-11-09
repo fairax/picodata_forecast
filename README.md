@@ -75,6 +75,17 @@ cartridge stop  # to prevent "address already in use" error
 .rocks/bin/luatest -v
 ```
 
+To test the Rust storage integration, build the shared library and run:
+
+```bash
+./cartridge.pre-build
+.rocks/bin/luatest -v test/integration/storage_test.lua
+```
+
+These tests start a temporary Cartridge storage instance and exercise the compiled
+Rust procedures through `net.box`. They cover schema initialization, cache reads,
+overwrites, missing keys, and expiration. They do not test vshard routing or replication.
+
 ## Admin
 
 Application has admin function [`probe`](./app/admin.lua) configured.

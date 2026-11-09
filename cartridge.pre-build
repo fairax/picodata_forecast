@@ -1,8 +1,11 @@
 #!/bin/sh
 
-# Simple pre-build script
-# Will be ran before "tarantoolctl rocks make" on application build
-# Could be useful to install non-standart rocks modules
+set -eu
 
-# For example:
-# tarantoolctl rocks make --chdir ./third_party/my-custom-rock-module
+app_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+cargo build --release --locked \
+    --manifest-path "$app_dir/rust/Cargo.toml" \
+    --target-dir "$app_dir/rust/target"
+
+cp "$app_dir/rust/target/release/libforecast.so" "$app_dir/forecast.so"

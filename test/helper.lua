@@ -13,13 +13,15 @@ helper.server_command = fio.pathjoin(helper.root, 'init.lua')
 
 helper.cluster = cartridge_helpers.Cluster:new({
     server_command = helper.server_command,
-    datadir = helper.datadir,
+    datadir = fio.pathjoin(helper.datadir, 'api'),
+    base_http_port = 28080,
+    base_advertise_port = 28300,
     use_vshard = false,
     replicasets = {
         {
             alias = 'api',
             uuid = cartridge_helpers.uuid('a'),
-            roles = {'app.roles.proxy'},
+            roles = {'app.roles.custom'},
             servers = {
                 { instance_uuid = cartridge_helpers.uuid('a', 1), alias = 'api' },
             },

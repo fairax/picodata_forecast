@@ -1,4 +1,6 @@
 .rocks
+.vscode
+.cargo
 .swo
 .swp
 CMakeCache.txt
@@ -20,3 +22,5 @@ __pycache__
 node_modules
 /tmp/*
 !/tmp/.keep
+rust/target
+forecast.so
