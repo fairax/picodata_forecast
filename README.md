@@ -28,12 +28,25 @@ It configures package search path to correctly start application on production
 ## Roles
 
 Application has one simple role, [`app.roles.custom`](./app/roles/custom.lua).
-It exposes `/hello` and `/metrics` endpoints:
+It exposes `/forecast` for cached forecast requests and `/metrics` for metrics:
 
 ```bash
-curl localhost:8081/hello
+curl 'localhost:8081/forecast?latitude=56&longitude=60&current=temperature_2m'
 curl localhost:8081/metrics
 ```
+
+The router normalizes forecast query parameters, computes a vshard bucket with
+`bucket_id_strcrc32`, and calls `forecast.fetch_with_cache` on that bucket's owner.
+The stored `bucket_id` is the routing bucket, so cached tuples move with their bucket.
+The low-level Rust procedure takes `(query, bucket_id)`; use `/forecast` for normal
+requests so vshard validates ownership and holds the bucket while the request runs.
+
+Upstream HTTP responses retain their status, body, and relevant headers, including
+`Content-Type` and `Retry-After`. Only successful (200–299) responses are cached.
+Upstream timeouts return a generic 504 response, connection/TLS failures return 502,
+and internal application or storage failures return 500. Detailed internal errors
+are logged on the server; router-to-storage communication failures return a generic
+502. No application-level retries are performed.
 
 Also, Cartridge roles [are registered](./init.lua)
 (`vshard-storage`, `vshard-router` and `metrics`).
@@ -84,7 +97,15 @@ To test the Rust storage integration, build the shared library and run:
 
 These tests start a temporary Cartridge storage instance and exercise the compiled
 Rust procedures through `net.box`. They cover schema initialization, cache reads,
-overwrites, missing keys, and expiration. They do not test vshard routing or replication.
+refreshes, missing keys, and expiration. They do not test vshard routing or replication.
+
+The forecast integration tests additionally start a router and two storage shards,
+checking normalized-query routing, tuple bucket ownership, and cached reads after a
+bucket transfer:
+
+```bash
+.rocks/bin/luatest -v test/integration/fetch_with_cache_test.lua
+```
 
 ## Admin
 
