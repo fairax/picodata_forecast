@@ -126,7 +126,7 @@ g.test_expired_read_deletes_entry = function(cg)
     local response = call(cg, 'fetch_with_cache', 'expired=1')
     t.assert_equals(response.status, 503)
     t.assert_equals(response.body, cg.body)
-    t.assert_equals(cg.requests, 1)
+    t.assert_equals(cg.requests, 3)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
 end
 

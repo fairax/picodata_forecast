@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tarantool::tuple::Tuple;
 use tarantool::space::UpdateOps;
-use tarantool::{index::{FieldType as IndexField, IteratorType}, space::{Field, Space}};
+use tarantool::tuple::Tuple;
+use tarantool::{
+    index::{FieldType as IndexField, IteratorType},
+    space::{Field, Space},
+};
 
-use crate::{forecast::Response, Result};
+use crate::{Result, forecast::Response};
 
 pub fn now() -> u64 {
     SystemTime::now()
@@ -83,31 +86,41 @@ pub fn create_schema() -> tarantool::Result<()> {
         ])
         .create()?;
 
-    space.index_builder("primary")
+    space
+        .index_builder("primary")
         .id(0)
         .unique(true)
         .parts([("key", IndexField::String)])
         .if_not_exists(true)
         .create()?;
 
-    space.index_builder("bucket_id")
+    space
+        .index_builder("bucket_id")
         .id(1)
         .unique(false)
         .parts([("bucket_id", IndexField::Unsigned)])
         .if_not_exists(true)
         .create()?;
 
-    space.index_builder("expires_at")
+    space
+        .index_builder("expires_at")
         .id(2)
         .unique(false)
-        .parts([("expires_at", IndexField::Unsigned), ("key", IndexField::String)])
+        .parts([
+            ("expires_at", IndexField::Unsigned),
+            ("key", IndexField::String),
+        ])
         .if_not_exists(true)
         .create()?;
 
-    space.index_builder("lru")
+    space
+        .index_builder("lru")
         .id(3)
         .unique(false)
-        .parts([("last_access", IndexField::Unsigned), ("key", IndexField::String)])
+        .parts([
+            ("last_access", IndexField::Unsigned),
+            ("key", IndexField::String),
+        ])
         .if_not_exists(true)
         .create()?;
 

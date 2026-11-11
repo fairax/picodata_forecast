@@ -8,6 +8,12 @@ mod storage;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[proc]
+fn init_forecast() -> Result<()> {
+    forecast::initialize()
+        .map_err(|error| format!("Invalid forecast configuration: {error:?}").into())
+}
+
+#[proc]
 fn create_schema() -> tarantool::Result<()> {
     storage::create_schema()
 }

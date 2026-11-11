@@ -46,7 +46,32 @@ Upstream HTTP responses retain their status, body, and relevant headers, includi
 Upstream timeouts return a generic 504 response, connection/TLS failures return 502,
 and internal application or storage failures return 500. Detailed internal errors
 are logged on the server; router-to-storage communication failures return a generic
-502. No application-level retries are performed.
+502.
+
+Forecast fetching allows up to three attempts for temporary transport failures and
+HTTP 429, 502, 503, and 504. All attempts and delays share a budget configured by
+`OPEN_METEO_TIMEOUT_SECS` (positive integer seconds, default 30), with
+at most 10 seconds per attempt. Retries use jittered backoff (up to 200 ms, then
+400 ms) and respect `Retry-After` seconds or HTTP dates. If that delay exceeds the
+remaining budget, the upstream response is returned immediately. Other HTTP errors,
+invalid configuration, and certificate validation failures are not retried. The last
+upstream HTTP response is preserved when retries are exhausted; only a successful
+response is cached. Concurrent requests are not coalesced.
+
+For example, set the budget before starting the instances:
+
+```bash
+export OPEN_METEO_TIMEOUT_SECS=15
+```
+
+`OPEN_METEO_FORECAST_URL` (default `https://api.open-meteo.com/v1/forecast`) and
+`OPEN_METEO_TIMEOUT_SECS` are read and validated once when the storage role starts,
+on both masters and replicas. Invalid URLs and empty, invalid, zero, or overflowing
+timeouts fail role initialization. Requests reuse the saved configuration; restart
+the storage processes to apply environment changes. The router's RPC timeout stays
+fixed at 35 seconds, so longer HTTP budgets can
+outlive the router's wait. The three-attempt limit and 10-second per-attempt cap
+still apply.
 
 Also, Cartridge roles [are registered](./init.lua)
 (`vshard-storage`, `vshard-router` and `metrics`).
@@ -106,6 +131,15 @@ bucket transfer:
 ```bash
 .rocks/bin/luatest -v test/integration/fetch_with_cache_test.lua
 ```
+
+The transport fault tests run a Lua fixture with Tarantool. The certificate test
+requires `openssl` on `PATH` to generate a temporary untrusted certificate and uses
+Tarantool's exported OpenSSL APIs through LuaJIT FFI. All fault servers listen on
+localhost only.
+The timeout test exercises three attempts within the real 30-second budget.
+
+Configuration tests restart test storage processes for new settings and use isolated
+processes to verify startup validation, including replicas and environment defaults.
 
 ## Admin
 
