@@ -66,6 +66,10 @@ g.before_each(function(cg)
     cg.body = '{"temperature":15}'
 end)
 
+g.after_each(function(cg)
+    cg.cluster.main_server.net_box:eval("require('app.roles.storage').apply_config(nil, {is_master = true})")
+end)
+
 g.test_schema = function(cg)
     local schema = cg.cluster.main_server.net_box:eval([[
         local space = assert(box.space.forecast_cache)
@@ -73,8 +77,9 @@ g.test_schema = function(cg)
         for _, name in ipairs({'primary', 'bucket_id', 'expires_at', 'lru'}) do
             indexes[name] = space.index[name].parts
         end
-        return {format = space:format(), indexes = indexes}
+        return {format = space:format(), indexes = indexes, temporary = space.temporary}
     ]])
+    t.assert_equals(schema.temporary, true)
     t.assert_equals(schema.format, {
         {name = 'key', type = 'string', is_nullable = false},
         {name = 'bucket_id', type = 'unsigned', is_nullable = false},
@@ -130,15 +135,51 @@ g.test_expired_read_deletes_entry = function(cg)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
 end
 
-g.test_insert_removes_expired_entries = function(cg)
+g.test_background_cleanup_removes_untouched_expired_entries = function(cg)
+    seed_expired(cg, 'expired=1')
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    end)
+    t.assert_equals(cg.requests, 0)
+end
+
+g.test_insert_does_not_scan_other_expired_entries = function(cg)
+    cg.cluster.main_server.net_box:eval("require('app.roles.storage').stop()")
     seed_expired(cg, 'expired=1')
     call(cg, 'fetch_with_cache', 'fresh=1')
-    local keys = cg.cluster.main_server.net_box:eval([[
-        local keys = {}
-        for _, tuple in box.space.forecast_cache:pairs() do
-            table.insert(keys, tuple[1])
-        end
-        return keys
+    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 2)
+    cg.cluster.main_server.net_box:eval("require('app.roles.storage').apply_config(nil, {is_master = true})")
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 1)
+    end)
+end
+
+g.test_restart_discards_cache_contents = function(cg)
+    call(cg, 'fetch_with_cache', 'restart=1')
+    local server = cg.cluster.main_server
+    server.net_box:eval('box.snapshot()')
+    server:stop()
+    server:start()
+    cg.cluster:wait_until_healthy(server)
+    t.assert_equals(server.net_box:eval('return box.space.forecast_cache.temporary'), true)
+    t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    t.assert_equals(call(cg, 'fetch_with_cache', 'restart=1').status, 200)
+    t.assert_equals(cg.requests, 2)
+end
+
+g.test_schema_migrates_persistent_cache_and_preserves_temporary_cache = function(cg)
+    cg.cluster.main_server.net_box:eval([[
+        require('app.roles.storage').stop()
+        box.space.forecast_cache:drop()
+        local space = box.schema.space.create('forecast_cache')
+        space:create_index('primary')
+        space:insert({1, 'legacy'})
     ]])
-    t.assert_equals(keys, {'fresh=1'})
+    call(cg, 'create_schema')
+    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache.temporary'), true)
+    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    call(cg, 'fetch_with_cache', 'preserve=1')
+    call(cg, 'create_schema')
+    t.assert_equals(call(cg, 'fetch_with_cache', 'preserve=1').headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 1)
 end

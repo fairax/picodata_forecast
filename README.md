@@ -58,6 +58,27 @@ invalid configuration, and certificate validation failures are not retried. The 
 upstream HTTP response is preserved when retries are exhausted; only a successful
 response is cached. Concurrent requests are not coalesced.
 
+Expired cache entries are removed by a background fiber on each writable storage
+master. Rust cleanup examines at most 100 expired candidates per batch using the
+`expires_at` index; the Lua role yields between batches and sleeps for one second
+after a sweep or error. Insertions do not scan for expired entries, and reads still
+reject expired responses immediately. Cleanup deletes candidates under vshard write references so bucket transfers
+can proceed safely. Selection and deletion do not yield within a batch, so
+candidates do not need to be reread. Cache triggers must not introduce yields. Moving or unavailable buckets are skipped until the next sweep.
+
+Role configuration starts cleanup on promotion and stops/joins it on demotion or
+role shutdown without interrupting an active batch. Explicit yields remain necessary
+because temporary-space deletes do not wait for WAL.
+
+Cache tuples live only in memory: they are neither written to WAL/snapshots nor
+replicated. Restart and replica promotion can produce cold caches. Schema and
+cluster metadata remain persistent; global WAL stays enabled. On master schema
+initialization, a legacy persistent `forecast_cache` is dropped and recreated as a
+temporary space, discarding its contents. Existing temporary spaces are preserved.
+This does not securely erase cache data from historical WAL or snapshot files.
+Restart storage instances after deploying the updated library and role. Periodic
+expiration does not impose a cache size limit or evict unexpired entries.
+
 For example, set the budget before starting the instances:
 
 ```bash

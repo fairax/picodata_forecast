@@ -5,75 +5,22 @@ use tarantool::space::UpdateOps;
 use tarantool::tuple::Tuple;
 use tarantool::{
     index::{FieldType as IndexField, IteratorType},
-    space::{Field, Space},
+    space::{Field, Space, SpaceType},
 };
 
 use crate::{Result, forecast::Response};
 
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
-}
-
-fn forecast_cache() -> Result<Space> {
-    Space::find("forecast_cache").ok_or_else(|| "Space 'forecast_cache' not found".into())
-}
-
-fn expires_at_index() -> Result<tarantool::index::Index> {
-    forecast_cache()?
-        .index("expires_at")
-        .ok_or("Missing cache index: expires_at".into())
-}
-
-fn expire() -> Result<Vec<String>> {
-    let index = expires_at_index()?;
-    let timestamp = now();
-    let expired_entries: Vec<String> = index
-        .select(IteratorType::LE, &(timestamp,))?
-        .map(|tuple| CacheEntry(&tuple).key())
-        .collect::<Result<Vec<_>>>()?;
-
-    let forecast_cache = forecast_cache()?;
-    for key in &expired_entries {
-        forecast_cache.delete(&(key,))?;
-    }
-    Ok(expired_entries)
-}
-
-pub struct CacheEntry<'a>(pub &'a Tuple);
-
-impl CacheEntry<'_> {
-    fn field<T: serde::de::DeserializeOwned>(&self, position: u32, name: &str) -> Result<T> {
-        self.0
-            .field(position)?
-            .ok_or_else(|| format!("Missing cache field: {name}").into())
-    }
-
-    pub fn key(&self) -> Result<String> {
-        self.field(0, "key")
-    }
-
-    pub fn status(&self) -> Result<u16> {
-        self.field(2, "status")
-    }
-
-    pub fn body(&self) -> Result<String> {
-        self.field(3, "body")
-    }
-
-    pub fn headers(&self) -> Result<BTreeMap<String, String>> {
-        self.field(4, "headers")
-    }
-
-    pub fn expires_at(&self) -> Result<u64> {
-        self.field(5, "expires_at")
-    }
-}
-
 pub fn create_schema() -> tarantool::Result<()> {
+    // Replace only a legacy persistent cache; temporary cache contents are disposable.
+    let persistent: bool = tarantool::lua_state()
+        .eval("return box.space.forecast_cache ~= nil and not box.space.forecast_cache.temporary")?;
+    if persistent {
+        if let Some(space) = Space::find("forecast_cache") {
+            space.drop()?;
+        }
+    }
     let space = Space::builder("forecast_cache")
+        .space_type(SpaceType::DataTemporary)
         .if_not_exists(true)
         .format([
             Field::string("key"),
@@ -133,7 +80,6 @@ pub fn add_cache_entry(
     response: &Response,
     ttl: Duration,
 ) -> Result<()> {
-    expire()?;
     let forecast_cache = forecast_cache()?;
     let timestamp = now();
     forecast_cache.replace(&(
@@ -166,4 +112,161 @@ pub fn get_cache_entry(key: &str) -> Result<Option<Response>> {
     forecast_cache.update(&(key,), ops)?;
     result.headers.insert("x-cache".into(), "HIT".into());
     Ok(Some(result))
+}
+
+pub fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros() as u64
+}
+
+fn forecast_cache() -> Result<Space> {
+    Space::find("forecast_cache").ok_or_else(|| "Space 'forecast_cache' not found".into())
+}
+
+pub struct CacheEntry<'a>(pub &'a Tuple);
+
+impl CacheEntry<'_> {
+    fn field<T: serde::de::DeserializeOwned>(&self, position: u32, name: &str) -> Result<T> {
+        self.0
+            .field(position)?
+            .ok_or_else(|| format!("Missing cache field: {name}").into())
+    }
+
+    pub fn key(&self) -> Result<String> {
+        self.field(0, "key")
+    }
+
+    pub fn bucket_id(&self) -> Result<u64> {
+        self.field(1, "bucket_id")
+    }
+
+    pub fn status(&self) -> Result<u16> {
+        self.field(2, "status")
+    }
+
+    pub fn body(&self) -> Result<String> {
+        self.field(3, "body")
+    }
+
+    pub fn headers(&self) -> Result<BTreeMap<String, String>> {
+        self.field(4, "headers")
+    }
+
+    pub fn expires_at(&self) -> Result<u64> {
+        self.field(5, "expires_at")
+    }
+}
+
+pub type CleanupCursor = (u64, String);
+
+#[derive(serde::Serialize)]
+pub struct CleanupBatch {
+    pub scanned: usize,
+    pub deleted: usize,
+    pub next_cursor: Option<CleanupCursor>,
+}
+
+// All bucket reference operations run on the Tarantool thread.
+struct BucketRef(Option<u64>);
+
+impl BucketRef {
+    fn acquire(bucket_id: u64, sharded: bool) -> Result<Option<Self>> {
+        if !sharded {
+            return Ok(Some(Self(None)));
+        }
+        let acquired: bool = tarantool::lua_state().eval_with(
+            "local id = ...; local ok = require('vshard').storage.bucket_refrw(id); return ok == true",
+            bucket_id,
+        ).map_err(tarantool::tlua::LuaError::from)?;
+        Ok(if acquired {
+            Some(Self(Some(bucket_id)))
+        } else {
+            None
+        })
+    }
+
+    fn release(mut self) -> Result<()> {
+        if let Some(bucket_id) = self.0.take() {
+            Self::release_bucket(bucket_id)?;
+        }
+        Ok(())
+    }
+
+    fn release_bucket(bucket_id: u64) -> Result<()> {
+        tarantool::lua_state().exec_with(
+            "local id = ...; local ok, err = require('vshard').storage.bucket_unrefrw(id); assert(ok, tostring(err))",
+            bucket_id,
+        ).map_err(tarantool::tlua::LuaError::from)?;
+        Ok(())
+    }
+}
+
+impl Drop for BucketRef {
+    fn drop(&mut self) {
+        if let Some(bucket_id) = self.0.take() {
+            if let Err(error) = Self::release_bucket(bucket_id) {
+                tarantool::say_error!("Could not release cleanup bucket reference: {}", error);
+            }
+        }
+    }
+}
+
+/// Examine at most 100 expired rows in index order without yielding.
+/// The caller yields between batches and restarts the sweep after next_cursor=None.
+pub fn cleanup_expired(cursor: Option<CleanupCursor>) -> Result<CleanupBatch> {
+    let mut batch = CleanupBatch {
+        scanned: 0,
+        deleted: 0,
+        next_cursor: None,
+    };
+    let lua = tarantool::lua_state();
+    let writable: bool = lua.eval("return not box.info.ro")?;
+    if !writable {
+        return Ok(batch);
+    }
+    let space = forecast_cache()?;
+    let index = space
+        .index("expires_at")
+        .ok_or("Missing cache index: expires_at")?;
+    let cutoff = now();
+    let iterator = match cursor {
+        Some(cursor) => index.select(IteratorType::GT, &cursor)?,
+        None => index.select(IteratorType::GE, &())?,
+    };
+    let sharded: bool = lua.eval("return box.space._bucket ~= nil")?;
+    // Deleting the current tuple is safe during traversal. Keep this loop non-yielding.
+    for tuple in iterator.take(100) {
+        let entry = CacheEntry(&tuple);
+        let expires_at = entry.expires_at()?;
+        if expires_at > cutoff {
+            break;
+        }
+        let key = entry.key()?;
+        let bucket_id = entry.bucket_id()?;
+        batch.scanned += 1;
+        // Advance even when this bucket is unavailable, avoiding starvation.
+        if batch.scanned == 100 {
+            batch.next_cursor = Some((expires_at, key.clone()));
+        }
+        let Some(reference) = BucketRef::acquire(bucket_id, sharded)? else {
+            continue; // Advance past locked/moving buckets; revisit on the next sweep.
+        };
+        let deletion = space.delete(&(key.as_str(),));
+        // Release even when deleting the candidate failed.
+        reference.release()?;
+        let deleted = match deletion {
+            Ok(tuple) => tuple.is_some(),
+            Err(error) => {
+                // Demotion may happen while a write yields; stop quietly then.
+                if lua.eval::<bool>("return box.info.ro")? {
+                    break;
+                }
+                return Err(error.into());
+            }
+        };
+        batch.deleted += usize::from(deleted);
+    }
+    Ok(batch)
 }

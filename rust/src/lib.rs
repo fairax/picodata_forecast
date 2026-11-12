@@ -19,6 +19,11 @@ fn create_schema() -> tarantool::Result<()> {
 }
 
 #[proc]
+fn cleanup_expired(cursor: Option<storage::CleanupCursor>) -> Result<storage::CleanupBatch> {
+    storage::cleanup_expired(cursor)
+}
+
+#[proc]
 fn normalize_query(query: &str) -> String {
     forecast::NormalizedQuery::new(query).to_string()
 }

@@ -411,6 +411,37 @@ g.test_cached_response_survives_bucket_move = function(cg)
     t.assert_equals(cg.requests, 1)
 end
 
+g.test_cleanup_runs_safely_during_bucket_transfer = function(cg)
+    local query = 'cleanup=migration'
+    local location = cg.cluster.servers[2].net_box:eval([[
+        local router = require('vshard').router
+        local bucket = router.bucket_id_strcrc32(...)
+        return {bucket = bucket, uuid = assert(router.route(bucket)).uuid}
+    ]], {query})
+    local source, destination
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        if server.replicaset_uuid == location.uuid then source = server else destination = server end
+    end
+    source.net_box:eval([[
+        local query, bucket, destination = ...
+        local space = box.space.forecast_cache
+        space:replace({query, bucket, 200, 'fresh', {['content-type'] = 'text/plain'}, 9007199254740991, 0})
+        space:replace({'expired-migration', bucket, 200, 'old', {['content-type'] = 'text/plain'}, 0, 0})
+        local ok, err = require('vshard').storage.bucket_send(bucket, destination)
+        assert(ok, tostring(err))
+    ]], {query, location.bucket, destination.replicaset_uuid})
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(destination.net_box:eval([[
+            return box.space.forecast_cache:get('expired-migration') == nil
+        ]]), true)
+    end)
+    local response = cg.cluster.servers[2]:http_request('get', '/forecast?' .. query)
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'fresh')
+    t.assert_equals(response.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 0)
+end
+
 
 g.test_transient_responses_retry_then_cache_success = function(cg)
     cg.auto_respond = true
