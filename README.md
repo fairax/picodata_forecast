@@ -44,9 +44,15 @@ requests so vshard validates ownership and holds the bucket while the request ru
 Upstream HTTP responses retain their status, body, and relevant headers, including
 `Content-Type` and `Retry-After`. Only successful (200–299) responses are cached.
 Upstream timeouts return a generic 504 response, connection/TLS failures return 502,
-and internal application or storage failures return 500. Detailed internal errors
+and internal application failures return 500. Detailed internal errors
 are logged on the server; router-to-storage communication failures return a generic
 502.
+
+Cache operations are best-effort: lookup or decoding failures fall back to upstream,
+access-time update failures still serve valid cached responses, and expired-entry
+deletion failures never cause expired data to be served. Any insertion failure
+(including memory exhaustion or oversized tuples) is logged without changing the
+upstream response. Cache failures can increase upstream traffic.
 
 Forecast fetching allows up to three attempts for temporary transport failures and
 HTTP 429, 502, 503, and 504. All attempts and delays share a budget configured by

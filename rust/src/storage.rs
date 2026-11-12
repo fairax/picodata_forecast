@@ -103,13 +103,21 @@ pub fn get_cache_entry(key: &str) -> Result<Option<Response>> {
     let entry = CacheEntry(&tuple);
     let timestamp = now();
     if entry.expires_at()? <= timestamp {
-        forecast_cache.delete(&(key,))?;
+        if let Err(error) = forecast_cache.delete(&(key,)) {
+            tarantool::say_error!("Expired cache entry deletion failed: {}", error);
+        }
         return Ok(None);
     }
     let mut result: Response = (&tuple).try_into()?;
-    let mut ops = UpdateOps::new();
-    ops.assign(6, timestamp)?;
-    forecast_cache.update(&(key,), ops)?;
+    let touch = (|| -> Result<()> {
+        let mut ops = UpdateOps::new();
+        ops.assign(6, timestamp)?;
+        forecast_cache.update(&(key,), ops)?;
+        Ok(())
+    })();
+    if let Err(error) = touch {
+        tarantool::say_error!("Cache access time update failed: {}", error);
+    }
     result.headers.insert("x-cache".into(), "HIT".into());
     Ok(Some(result))
 }

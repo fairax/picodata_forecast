@@ -318,7 +318,7 @@ g.test_invalid_configuration_fails_role_startup = function(cg)
     t.assert_equals(cg.requests, 0)
 end
 
-g.test_cache_lookup_failure_is_generic_500 = function(cg)
+g.test_cache_decode_failure_fetches_upstream = function(cg)
     local router = cg.cluster.servers[2]
     cg.gate:put(true)
     t.assert_equals(router:http_request('get', '/forecast?corrupt=1').status, 200)
@@ -331,20 +331,28 @@ g.test_cache_lookup_failure_is_generic_500 = function(cg)
             end
         ]])
     end
+    cg.gate:put(true)
     local response = router:http_request('get', '/forecast?corrupt=1', {raise = false})
-    t.assert_equals(response.status, 500)
-    t.assert_equals(response.body, 'Internal server error')
-    t.assert_equals(cg.requests, 1)
+    t.assert_equals(response.status, 200)
+    t.assert_equals(cg.requests, 2)
+    t.assert_equals(router:http_request('get', '/forecast?corrupt=1').headers['x-cache'], 'HIT')
 end
 
-g.test_cache_insertion_failure_is_generic_500 = function(cg)
+g.test_oversized_cache_insertion_preserves_response = function(cg)
     -- Exceed memtx_max_tuple_size without changing production configuration.
     cg.body = string.rep('private-upstream-body', 100000)
     cg.gate:put(true)
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?oversized=1', {raise = false})
-    t.assert_equals(response.status, 500)
-    t.assert_equals(response.body, 'Internal server error')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, cg.body)
     t.assert_equals(cg.requests, 1)
+    cg.body = 'small again'
+    cg.gate:put(true)
+    local retried = cg.cluster.servers[2]:http_request('get', '/forecast?oversized=1')
+    t.assert_equals(retried.body, cg.body)
+    t.assert_equals(retried.headers['x-cache'], nil)
+    t.assert_equals(cg.requests, 2)
+    t.assert_equals(cg.cluster.servers[2]:http_request('get', '/forecast?oversized=1').headers['x-cache'], 'HIT')
 end
 
 g.test_queries_distribute_across_both_shards = function(cg)

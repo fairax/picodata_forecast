@@ -67,6 +67,12 @@ g.before_each(function(cg)
 end)
 
 g.after_each(function(cg)
+    cg.cluster.main_server.net_box:eval([[
+        if rawget(_G, 'cache_failure_trigger') then
+            box.space.forecast_cache:before_replace(nil, cache_failure_trigger)
+            rawset(_G, 'cache_failure_trigger', nil)
+        end
+    ]])
     cg.cluster.main_server.net_box:eval("require('app.roles.storage').apply_config(nil, {is_master = true})")
 end)
 
@@ -181,5 +187,70 @@ g.test_schema_migrates_persistent_cache_and_preserves_temporary_cache = function
     call(cg, 'fetch_with_cache', 'preserve=1')
     call(cg, 'create_schema')
     t.assert_equals(call(cg, 'fetch_with_cache', 'preserve=1').headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_insertion_errors_preserve_upstream_and_recover = function(cg)
+    for _, code in ipairs({'MEMORY_ISSUE', 'ILLEGAL_PARAMS'}) do
+        cg.cluster.main_server.net_box:eval([[
+            local code = ...
+            rawset(_G, 'cache_failure_trigger', function() box.error(box.error[code], 'injected cache failure') end)
+            box.space.forecast_cache:before_replace(cache_failure_trigger)
+        ]], {code})
+        local query = 'insertion=' .. code
+        local response = call(cg, 'fetch_with_cache', query)
+        t.assert_equals(response.status, 200)
+        t.assert_equals(response.body, cg.body)
+        t.assert_equals(response.headers['content-type'], 'application/json')
+        t.assert_equals(response.headers['x-cache'], nil)
+        t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+        local requests = cg.requests
+        call(cg, 'fetch_with_cache', query)
+        t.assert_equals(cg.requests, requests + 1)
+        cg.cluster.main_server.net_box:eval([[
+            box.space.forecast_cache:before_replace(nil, cache_failure_trigger)
+            rawset(_G, 'cache_failure_trigger', nil)
+        ]])
+    end
+    call(cg, 'fetch_with_cache', 'recovered=1')
+    t.assert_equals(call(cg, 'fetch_with_cache', 'recovered=1').headers['x-cache'], 'HIT')
+end
+
+g.test_access_time_failure_serves_cached_response = function(cg)
+    call(cg, 'fetch_with_cache', 'touch=1')
+    cg.cluster.main_server.net_box:eval([[
+        rawset(_G, 'cache_failure_trigger', function() error('injected touch failure') end)
+        box.space.forecast_cache:before_replace(cache_failure_trigger)
+    ]])
+    local response = call(cg, 'fetch_with_cache', 'touch=1')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, cg.body)
+    t.assert_equals(response.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_failed_expired_deletion_does_not_serve_stale_response = function(cg)
+    cg.cluster.main_server.net_box:eval([[
+        require('app.roles.storage').stop()
+        box.space.forecast_cache:replace({'expired-failure=1', 1, 200, 'stale', {type = 'text'}, 0, 0})
+        rawset(_G, 'cache_failure_trigger', function() error('injected cache write failure') end)
+        box.space.forecast_cache:before_replace(cache_failure_trigger)
+    ]])
+    local response = call(cg, 'fetch_with_cache', 'expired-failure=1')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, cg.body)
+    t.assert_equals(response.headers['x-cache'], nil)
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_missing_cache_space_fetches_upstream = function(cg)
+    cg.cluster.main_server.net_box:eval([[
+        require('app.roles.storage').stop()
+        box.space.forecast_cache:drop()
+    ]])
+    local response = call(cg, 'fetch_with_cache', 'missing-space=1')
+    call(cg, 'create_schema')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, cg.body)
     t.assert_equals(cg.requests, 1)
 end

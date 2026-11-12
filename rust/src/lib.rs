@@ -34,10 +34,10 @@ fn fetch_with_cache(query: &str, bucket_id: u64) -> Result<forecast::Response> {
 
     let result = (|| -> std::result::Result<forecast::Response, FetchError> {
         let normalized_query = forecast::NormalizedQuery::new(query);
-        if let Some(response) =
-            storage::get_cache_entry(&normalized_query).map_err(FetchError::internal)?
-        {
-            return Ok(response);
+        match storage::get_cache_entry(&normalized_query) {
+            Ok(Some(response)) => return Ok(response),
+            Ok(None) => {},
+            Err(error) => tarantool::say_error!("Cache lookup failed: {}", error),
         }
 
         let cache_key = normalized_query.to_string();
@@ -68,13 +68,14 @@ fn fetch_with_cache(query: &str, bucket_id: u64) -> Result<forecast::Response> {
         if !(200..300).contains(&response.status) {
             return Ok(response);
         }
-        storage::add_cache_entry(
+        if let Err(error) = storage::add_cache_entry(
             cache_key,
             bucket_id,
             &response,
             std::time::Duration::from_secs(60),
-        )
-        .map_err(FetchError::internal)?;
+        ) {
+            tarantool::say_error!("Cache insertion failed: {}", error);
+        }
         Ok(response)
     })();
     Ok(result.unwrap_or_else(forecast::Response::from))
