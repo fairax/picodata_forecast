@@ -12,8 +12,9 @@ use crate::{Result, forecast::Response};
 
 pub fn create_schema() -> tarantool::Result<()> {
     // Replace only a legacy persistent cache; temporary cache contents are disposable.
-    let persistent: bool = tarantool::lua_state()
-        .eval("return box.space.forecast_cache ~= nil and not box.space.forecast_cache.temporary")?;
+    let persistent: bool = tarantool::lua_state().eval(
+        "return box.space.forecast_cache ~= nil and not box.space.forecast_cache.temporary",
+    )?;
     if persistent {
         if let Some(space) = Space::find("forecast_cache") {
             space.drop()?;

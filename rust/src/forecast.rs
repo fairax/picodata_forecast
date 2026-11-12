@@ -1,5 +1,5 @@
 use std::error::Error as _;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use std::{collections::BTreeMap, ops::Deref};
@@ -14,6 +14,7 @@ pub enum FetchError {
     Timeout(String),
     Transport(String),
     Internal(String),
+    TooLarge(String),
 }
 
 impl FetchError {
@@ -37,6 +38,7 @@ impl From<FetchError> for Response {
         let (status, body, detail) = match error {
             FetchError::Timeout(detail) => (504, "Forecast request timed out", detail),
             FetchError::Transport(detail) => (502, "Forecast service unavailable", detail),
+            FetchError::TooLarge(detail) => (502, "Forecast response too large", detail),
             FetchError::Internal(detail) => (500, "Internal server error", detail),
         };
         // Called only on the Tarantool thread, after the HTTP worker returns.
@@ -106,6 +108,7 @@ impl Deref for NormalizedQuery {
 struct ForecastConfig {
     endpoint: reqwest::Url,
     timeout: Duration,
+    max_response_bytes: usize,
 }
 
 static CONFIG: OnceLock<ForecastConfig> = OnceLock::new();
@@ -129,8 +132,29 @@ pub fn initialize() -> std::result::Result<(), FetchError> {
     Instant::now().checked_add(timeout).ok_or_else(|| {
         FetchError::internal("OPEN_METEO_TIMEOUT_SECS exceeds the supported deadline range")
     })?;
+    let max_response_bytes = match std::env::var("OPEN_METEO_MAX_RESPONSE_BYTES") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|&size| size > 0 && size < usize::MAX)
+            .ok_or_else(|| {
+                FetchError::internal(
+                    "OPEN_METEO_MAX_RESPONSE_BYTES must be a positive integer below usize::MAX",
+                )
+            })?,
+        Err(std::env::VarError::NotPresent) => 1_048_576,
+        Err(error) => {
+            return Err(FetchError::internal(format!(
+                "OPEN_METEO_MAX_RESPONSE_BYTES: {error}"
+            )));
+        }
+    };
     CONFIG
-        .set(ForecastConfig { endpoint, timeout })
+        .set(ForecastConfig {
+            endpoint,
+            timeout,
+            max_response_bytes,
+        })
         .map_err(|_| FetchError::internal("Forecast configuration is already initialized"))
 }
 
@@ -156,7 +180,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
         .ok_or_else(|| FetchError::internal("Forecast configuration has not been initialized"))?;
     let mut url = config.endpoint.clone();
     url.set_query(Some(query.as_str()));
-    
+
     // Share one deadline across attempts, backoff, and Retry-After delays so
     // retries cannot each restart the full timeout budget.
     let deadline = Instant::now().checked_add(config.timeout).ok_or_else(|| {
@@ -175,7 +199,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
             ));
         }
         let timeout = remaining.min(Duration::from_secs(10));
-        let outcome = fetch_once(&client, &url, timeout);
+        let outcome = fetch_once(&client, url.clone(), timeout, config.max_response_bytes);
         let delay = Duration::from_millis(fastrand::u64(0..=200 * (1 << attempt)));
         let (failure, delay) = match outcome {
             Ok(response) => {
@@ -190,12 +214,11 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
                 (Ok(response), delay.max(retry_after))
             }
             Err(error) => {
-                let retry = attempt < 2 && retryable_transport(&error);
-                let error = FetchError::http(error);
-                if !retry {
-                    return Err(error);
+                let failure = error.classify(config.max_response_bytes);
+                if attempt == 2 || !failure.retryable {
+                    return Err(failure.error);
                 }
-                (Err(error), delay)
+                (Err(failure.error), delay)
             }
         };
         // Preserve the last response/error if there is no time for another attempt.
@@ -248,40 +271,107 @@ fn retryable_transport(error: &reqwest::Error) -> bool {
     let mut source = error.source();
     while let Some(cause) = source {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io.kind(),
-                ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-                    | ErrorKind::UnexpectedEof
-                    | ErrorKind::WouldBlock
-                    | ErrorKind::Interrupted
-                    | ErrorKind::NotConnected
-            );
+            return retryable_io(io);
         }
         source = cause.source();
     }
     false
 }
 
+fn retryable_io(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::TimedOut
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::WouldBlock
+            | ErrorKind::Interrupted
+            | ErrorKind::NotConnected
+    )
+}
+
+enum AttemptError {
+    Http(reqwest::Error),
+    Read(std::io::Error),
+    TooLarge,
+}
+
+struct ClassifiedFailure {
+    error: FetchError,
+    retryable: bool,
+}
+
+impl AttemptError {
+    fn classify(self, max_bytes: usize) -> ClassifiedFailure {
+        match self {
+            Self::Http(error) => ClassifiedFailure {
+                retryable: retryable_transport(&error),
+                error: FetchError::http(error),
+            },
+            Self::Read(error) => {
+                let http_error = error
+                    .get_ref()
+                    .and_then(|cause| cause.downcast_ref::<reqwest::Error>());
+                let timeout = error.kind() == ErrorKind::TimedOut
+                    || http_error.is_some_and(reqwest::Error::is_timeout);
+                let retryable =
+                    timeout || retryable_io(&error) || http_error.is_some_and(retryable_transport);
+                let detail = error.to_string();
+                ClassifiedFailure {
+                    error: if timeout {
+                        FetchError::Timeout(detail)
+                    } else {
+                        FetchError::Transport(detail)
+                    },
+                    retryable,
+                }
+            }
+            Self::TooLarge => ClassifiedFailure {
+                error: FetchError::TooLarge(format!("Upstream response exceeds {max_bytes} bytes")),
+                retryable: false,
+            },
+        }
+    }
+}
+
 fn fetch_once(
     client: &reqwest::blocking::Client,
-    url: &reqwest::Url,
+    url: reqwest::Url,
     timeout: Duration,
-) -> reqwest::Result<Response> {
-    let response = client.get(url.clone()).timeout(timeout).send()?;
+    max_bytes: usize,
+) -> std::result::Result<Response, AttemptError> {
+    let response = client
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .map_err(AttemptError::Http)?;
     let status = response.status().as_u16();
     let headers = response
         .headers()
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
         .collect::<BTreeMap<_, _>>();
-    let body = response.text()?;
+    // Probe one extra byte: headers can omit or misrepresent the body length.
+    let mut bytes = Vec::new();
+    response
+        .take((max_bytes + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(AttemptError::Read)?;
+    if bytes.len() > max_bytes {
+        return Err(AttemptError::TooLarge);
+    }
+    // Match Reqwest text() with charset disabled; replacement characters can
+    // expand the UTF-8 output, which must also fit the configured limit.
+    let text = String::from_utf8_lossy(&bytes);
+    if text.len() > max_bytes {
+        return Err(AttemptError::TooLarge);
+    }
     Ok(Response {
         status,
-        body,
+        body: text.into_owned(),
         headers,
     })
 }

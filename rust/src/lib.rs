@@ -36,7 +36,7 @@ fn fetch_with_cache(query: &str, bucket_id: u64) -> Result<forecast::Response> {
         let normalized_query = forecast::NormalizedQuery::new(query);
         match storage::get_cache_entry(&normalized_query) {
             Ok(Some(response)) => return Ok(response),
-            Ok(None) => {},
+            Ok(None) => {}
             Err(error) => tarantool::say_error!("Cache lookup failed: {}", error),
         }
 

@@ -23,25 +23,28 @@ local function finish(future)
     return values[1]
 end
 
-local function configure(cg, endpoint, timeout)
+local function configure(cg, endpoint, timeout, max_bytes)
     timeout = timeout or '30'
     for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
-        if server.env.OPEN_METEO_FORECAST_URL ~= endpoint or server.env.OPEN_METEO_TIMEOUT_SECS ~= timeout then
+        if server.env.OPEN_METEO_FORECAST_URL ~= endpoint or server.env.OPEN_METEO_TIMEOUT_SECS ~= timeout
+            or server.env.OPEN_METEO_MAX_RESPONSE_BYTES ~= max_bytes then
             server:stop()
             server.env.OPEN_METEO_FORECAST_URL = endpoint
             server.env.OPEN_METEO_TIMEOUT_SECS = timeout
+            server.env.OPEN_METEO_MAX_RESPONSE_BYTES = max_bytes
             server:start()
             cg.cluster:wait_until_healthy(server)
         end
     end
 end
 
-local function probe_configuration(endpoint, timeout, replica)
+local function probe_configuration(endpoint, timeout, replica, max_bytes)
     local directory = fio.tempdir()
     local output = fio.pathjoin(directory, 'result.json')
     local env = table.copy(os.environ())
     env.OPEN_METEO_FORECAST_URL = endpoint
     env.OPEN_METEO_TIMEOUT_SECS = timeout
+    env.OPEN_METEO_MAX_RESPONSE_BYTES = max_bytes
     local process = require('luatest.process'):start('/usr/local/bin/tarantool', {
         fio.pathjoin(helper.root, 'test', 'fixtures', 'forecast_config_probe.lua'),
         helper.root, output, directory, replica and 'replica' or 'master',
@@ -340,7 +343,7 @@ end
 
 g.test_oversized_cache_insertion_preserves_response = function(cg)
     -- Exceed memtx_max_tuple_size without changing production configuration.
-    cg.body = string.rep('private-upstream-body', 100000)
+    cg.body = string.rep('x', 1048576)
     cg.gate:put(true)
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?oversized=1', {raise = false})
     t.assert_equals(response.status, 200)
@@ -620,4 +623,84 @@ g.test_initialized_configuration_is_stable = function(cg)
         os.setenv('OPEN_METEO_FORECAST_URL', ...)
         os.setenv('OPEN_METEO_TIMEOUT_SECS', '30')
     ]], {cg.endpoint})
+end
+
+g.test_response_body_limit_boundaries = function(cg)
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    for _, size in ipairs({1048575, 1048576, 1048577}) do
+        cg.body = string.rep('x', size)
+        local before = cg.requests
+        local response = router:http_request('get', '/forecast?size=' .. size, {raise = false})
+        if size <= 1048576 then
+            t.assert_equals(response.status, 200)
+            t.assert_equals(response.body, cg.body)
+        else
+            t.assert_equals(response.status, 502)
+            t.assert_equals(response.body, 'Forecast response too large')
+        end
+        t.assert_equals(cg.requests, before + 1)
+    end
+end
+
+g.test_oversized_errors_are_not_retried_and_smaller_responses_recover = function(cg)
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    for _, status in ipairs({400, 429, 503}) do
+        cg.status = status
+        cg.body = string.rep('x', 1048577)
+        local before = cg.requests
+        local response = router:http_request('get', '/forecast?overflow=' .. status, {raise = false})
+        t.assert_equals(response.status, 502)
+        t.assert_equals(response.body, 'Forecast response too large')
+        t.assert_equals(cg.requests, before + 1)
+    end
+    cg.status, cg.body = 200, 'recovered'
+    local response = router:http_request('get', '/forecast?overflow=503')
+    t.assert_equals(response.body, 'recovered')
+    t.assert_equals(response.headers['x-cache'], nil)
+    t.assert_equals(router:http_request('get', '/forecast?overflow=503').headers['x-cache'], 'HIT')
+end
+
+g.test_custom_body_limit_and_utf8_expansion = function(cg)
+    configure(cg, cg.endpoint, '30', '8')
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    for i, body in ipairs({'12345678', '123456789', string.char(255, 255, 255)}) do
+        cg.body = body
+        local response = router:http_request('get', '/forecast?custom-size=' .. i, {raise = false})
+        t.assert_equals(response.status, i == 1 and 200 or 502)
+    end
+    t.assert_equals(cg.requests, 3)
+end
+
+g.test_invalid_body_limits_fail_initialization = function(cg)
+    for _, value in ipairs({'', '0', '-1', 'abc', '1.5', string.char(255),
+        '18446744073709551615', '18446744073709551616'}) do
+        local result = probe_configuration(cg.endpoint, '30', false, value)
+        t.assert_equals(result.ok, false)
+        t.assert_str_contains(result.error, 'OPEN_METEO_MAX_RESPONSE_BYTES')
+    end
+    t.assert_equals(probe_configuration(cg.endpoint, '30', true, '8').ok, true)
+end
+
+g.test_chunked_body_limit_and_fiber_responsiveness = function(cg)
+    fault_upstream(cg, 'chunked-oversized')
+    local future = fetch(cg, 'chunked=1', true)
+    -- The upstream sends headers then delays its body. Other TX fibers must run.
+    fiber.sleep(0.1)
+    t.assert_equals(cg.cluster.main_server.net_box:eval('return 42'), 42)
+    local response = finish(future)
+    t.assert_equals(response.response.status, 502)
+    t.assert_equals(response.response.body, 'Forecast response too large')
+    t.assert_equals(fault_state(cg).count, 1)
+end
+
+g.test_body_read_timeout_is_504 = function(cg)
+    fault_upstream(cg, 'slow-body')
+    configure(cg, cg.cluster.main_server.env.OPEN_METEO_FORECAST_URL, '1')
+    local response = fetch(cg, 'body-timeout=1')
+    t.assert_equals(response.response.status, 504)
+    t.assert_equals(response.response.body, 'Forecast request timed out')
+    t.assert_equals(fault_state(cg).count, 1)
 end

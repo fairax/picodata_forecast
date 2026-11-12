@@ -180,3 +180,16 @@ cartridge admin probe \
   --run-dir ./tmp/run \
   --uri localhost:3302
 ```
+
+### Upstream body size limit
+
+`OPEN_METEO_MAX_RESPONSE_BYTES` limits each fetched body to 1,048,576 bytes (1 MiB)
+by default. Set a positive integer byte count before starting storage instances,
+for example `export OPEN_METEO_MAX_RESPONSE_BYTES=2097152`. Configuration is
+validated once at role initialization; restart storage instances after changes.
+Bodies exactly at the limit are accepted. The worker reads at most one extra byte
+to detect overflow, including chunked responses without Content-Length. The limit
+also applies after UTF-8 text conversion. Oversized bodies of any HTTP status
+return generic 502 (`Forecast response too large`), are not retried or cached, and
+have details logged on the server. No compression or separate cache size limit is
+added; an accepted response is returned even if cache insertion fails.
