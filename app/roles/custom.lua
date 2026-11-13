@@ -7,6 +7,7 @@ local log = require('log')
 local lib
 local max_concurrent_fetches
 local active_fetches = 0
+local forecast_route_name = 'app.roles.custom.forecast'
 
 local function cache_get(query, bucket_id)
     local ok, response, err = pcall(require('vshard').router.callrw,
@@ -95,7 +96,7 @@ local function init(opts) -- luacheck: no unused args
     lib:load('init_forecast')()
 
     local httpd = assert(cartridge.service_get('httpd'), "Failed to get httpd service")
-    httpd:route({method = 'GET', path = '/forecast'}, function(request)
+    httpd:route({name = forecast_route_name, method = 'GET', path = '/forecast'}, function(request)
         local response = fetch(request.query or '')
 
         return {status = response.status, body = response.body, headers = filter_headers(response.headers)}
@@ -105,6 +106,18 @@ local function init(opts) -- luacheck: no unused args
 end
 
 local function stop()
+    local httpd = cartridge.service_get('httpd')
+    if httpd ~= nil then
+        local index = httpd.iroutes[forecast_route_name]
+        if index ~= nil then
+            table.remove(httpd.routes, index)
+            httpd.iroutes[forecast_route_name] = nil
+            -- Removing a route shifts the indexes of subsequent named routes.
+            for i, route in ipairs(httpd.routes) do
+                if route.name then httpd.iroutes[route.name] = i end
+            end
+        end
+    end
     return true
 end
 

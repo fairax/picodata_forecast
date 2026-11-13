@@ -141,7 +141,22 @@ g.before_each(function(cg)
     cg.body = nil
 end)
 
+local function set_router_role(cg, enabled)
+    local roles = {'vshard-router'}
+    if enabled then table.insert(roles, 'app.roles.custom') end
+    cg.cluster.servers[2]:graphql({
+        query = [[mutation($rs: String!, $roles: [String!]!) {
+            cluster { edit_topology(replicasets: [{uuid: $rs, roles: $roles}]) { servers { uri } } }
+        }]],
+        variables = {rs = cg.cluster.servers[2].replicaset_uuid, roles = roles},
+    })
+end
+
 g.after_each(function(cg)
+    if cg.router_role_disabled then
+        set_router_role(cg, true)
+        cg.router_role_disabled = nil
+    end
     if cg.stopped_storage then
         cg.stopped_storage:start()
         cg.cluster:wait_until_healthy(cg.stopped_storage)
@@ -983,4 +998,48 @@ g.test_cached_headers_filtered_case_insensitively = function(cg)
     t.assert_equals(response.headers['retry-after'], '7')
     t.assert_equals(response.headers['x-cache'], 'HIT')
     t.assert_equals(cg.requests, 0)
+end
+
+g.test_router_role_disable_and_reenable = function(cg)
+    configure(cg, cg.endpoint, '30', nil, '1')
+    local router = cg.cluster.servers[2]
+    cg.auto_respond = true
+    t.assert_equals(fetch(cg, 'lifecycle=cached').response.status, 200)
+    cg.auto_respond = false
+    cg.entered:get(1)
+    local pending = fetch(cg, 'lifecycle=pending', true)
+    t.assert_equals(cg.entered:get(5), true)
+    local before = cg.requests
+    cg.router_role_disabled = true
+    set_router_role(cg, false)
+    for _, query in ipairs({'lifecycle=cached', 'lifecycle=disabled'}) do
+        local response = router:http_request('get', '/forecast?' .. query, {raise = false})
+        t.assert_equals(response.status, 404)
+    end
+    t.assert_equals(cg.requests, before)
+    router.net_box:eval([[
+        local httpd = require('cartridge').service_get('httpd')
+        assert(httpd.iroutes['app.roles.custom.forecast'] == nil)
+        for i, route in ipairs(httpd.routes) do
+            assert(route.path ~= '/forecast')
+            if route.name then assert(httpd.iroutes[route.name] == i) end
+        end
+        require('app.roles.custom').stop() -- Stopping twice must be harmless.
+    ]])
+    set_router_role(cg, true)
+    cg.router_role_disabled = nil
+    -- Re-enabling must retain permits held by requests that are still running.
+    t.assert_equals(fetch(cg, 'lifecycle=busy').response.body, 'Forecast service busy')
+    t.assert_equals(fetch(cg, 'lifecycle=cached').response.headers['x-cache'], 'HIT')
+    cg.gate:put(true)
+    t.assert_equals(finish(pending).response.status, 200)
+    cg.auto_respond = true
+    t.assert_equals(router:http_request('get', '/forecast?lifecycle=enabled').status, 200)
+    t.assert_equals(router.net_box:eval([[
+        local count = 0
+        for _, route in pairs(require('cartridge').service_get('httpd').routes) do
+            if route.path == '/forecast' then count = count + 1 end
+        end
+        return count
+    ]]), 1)
 end
