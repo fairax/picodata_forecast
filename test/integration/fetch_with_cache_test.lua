@@ -19,28 +19,31 @@ local function finish(future)
     return values[1]
 end
 
-local function configure(cg, endpoint, timeout, max_bytes)
+local function configure(cg, endpoint, timeout, max_bytes, concurrency)
     timeout = timeout or '30'
     for _, server in ipairs({cg.cluster.servers[2]}) do
         if server.env.OPEN_METEO_FORECAST_URL ~= endpoint or server.env.OPEN_METEO_TIMEOUT_SECS ~= timeout
-            or server.env.OPEN_METEO_MAX_RESPONSE_BYTES ~= max_bytes then
+            or server.env.OPEN_METEO_MAX_RESPONSE_BYTES ~= max_bytes
+            or server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES ~= concurrency then
             server:stop()
             server.env.OPEN_METEO_FORECAST_URL = endpoint
             server.env.OPEN_METEO_TIMEOUT_SECS = timeout
             server.env.OPEN_METEO_MAX_RESPONSE_BYTES = max_bytes
+            server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES = concurrency
             server:start()
             cg.cluster:wait_until_healthy(server)
         end
     end
 end
 
-local function probe_configuration(endpoint, timeout, replica, max_bytes)
+local function probe_configuration(endpoint, timeout, replica, max_bytes, concurrency)
     local directory = fio.tempdir()
     local output = fio.pathjoin(directory, 'result.json')
     local env = table.copy(os.environ())
     env.OPEN_METEO_FORECAST_URL = endpoint
     env.OPEN_METEO_TIMEOUT_SECS = timeout
     env.OPEN_METEO_MAX_RESPONSE_BYTES = max_bytes
+    env.OPEN_METEO_MAX_CONCURRENT_FETCHES = concurrency
     local process = require('luatest.process'):start('/usr/local/bin/tarantool', {
         fio.pathjoin(helper.root, 'test', 'fixtures', 'forecast_config_probe.lua'),
         helper.root, output, directory, replica and 'replica' or 'master',
@@ -819,4 +822,91 @@ g.test_native_fetch_on_router_does_not_access_cache = function(cg)
     for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
         t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
     end
+end
+
+g.test_fetch_limit_rejects_misses_but_serves_hits = function(cg)
+    configure(cg, cg.endpoint, '30', nil, '2')
+    cg.auto_respond = true
+    t.assert_equals(fetch(cg, 'limit=cached').response.status, 200)
+    cg.auto_respond = false
+    cg.entered:get(1)
+    local first = fetch(cg, 'limit=first', true)
+    t.assert_equals(cg.entered:get(5), true)
+    local second = fetch(cg, 'limit=second', true)
+    t.assert_equals(cg.entered:get(5), true)
+    cg.cluster.servers[2].net_box:eval("os.setenv('OPEN_METEO_MAX_CONCURRENT_FETCHES', '10')")
+    local before = cg.requests
+    local response = cg.cluster.servers[2]:http_request('get', '/forecast?limit=third', {raise = false})
+    t.assert_equals(response.status, 503)
+    t.assert_equals(response.body, 'Forecast service busy')
+    t.assert_equals(fetch(cg, 'limit=cached').response.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, before)
+    cg.gate:put(true)
+    t.assert_equals(finish(first).response.status, 200)
+    cg.auto_respond = true
+    t.assert_equals(fetch(cg, 'limit=released').response.status, 200)
+    cg.gate:put(true)
+    t.assert_equals(finish(second).response.status, 200)
+end
+
+g.test_fetch_limit_configuration = function(cg)
+    t.assert_equals(probe_configuration(cg.endpoint, '30', false, nil, '2').ok, true)
+    for _, value in ipairs({'', '0', '-1', '1.5', 'abc', ' 2', '1e2', '9007199254740992'}) do
+        local result = probe_configuration(cg.endpoint, '30', false, nil, value)
+        t.assert_equals(result.ok, false)
+        t.assert_str_contains(result.error, 'OPEN_METEO_MAX_CONCURRENT_FETCHES')
+    end
+end
+
+g.test_fetch_limit_retains_permit_during_cancellation = function(cg)
+    configure(cg, cg.endpoint, '30', nil, '1')
+    local router = cg.cluster.servers[2]
+    router.net_box:eval([[
+        local fiber = require('fiber')
+        rawset(_G, 'limited_fetch_done', false)
+        rawset(_G, 'limited_fetch', fiber.new(function()
+            pcall(require('app.roles.custom').fetch, 'limit=cancelled')
+            rawset(_G, 'limited_fetch_done', true)
+        end))
+    ]])
+    t.assert_equals(cg.entered:get(5), true)
+    router.net_box:eval([[
+        require('fiber').create(function() limited_fetch:cancel() end)
+    ]])
+    fiber.sleep(0.05)
+    t.assert_equals(fetch(cg, 'limit=while-cancelled').response.status, 503)
+    t.assert_equals(cg.requests, 1)
+    cg.gate:put(true)
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(router.net_box:eval('return limited_fetch_done'), true)
+    end)
+    cg.auto_respond = true
+    t.assert_equals(fetch(cg, 'limit=after-cancelled').response.status, 200)
+end
+
+g.test_fetch_limit_releases_after_timeout_and_errors = function(cg)
+    configure(cg, cg.endpoint, '1', nil, '1')
+    t.assert_equals(fetch(cg, 'limit=timeout').response.status, 504)
+    cg.auto_respond = true
+    cg.status = 400
+    t.assert_equals(fetch(cg, 'limit=error').response.status, 400)
+    cg.status = 200
+    t.assert_equals(fetch(cg, 'limit=after-error').response.status, 200)
+end
+
+g.test_fetch_limit_holds_permit_across_retries = function(cg)
+    configure(cg, cg.endpoint, '30', nil, '1')
+    cg.actions = {{status = 503}, {status = 200}}
+    local pending = fetch(cg, 'limit=retry', true)
+    t.assert_equals(cg.entered:get(5), true)
+    t.assert_equals(fetch(cg, 'limit=before-retry').response.status, 503)
+    t.assert_equals(cg.requests, 1)
+    cg.gate:put(true)
+    t.assert_equals(cg.entered:get(5), true)
+    t.assert_equals(fetch(cg, 'limit=during-retry').response.status, 503)
+    t.assert_equals(cg.requests, 2)
+    cg.gate:put(true)
+    t.assert_equals(finish(pending).response.status, 200)
+    cg.auto_respond = true
+    t.assert_equals(fetch(cg, 'limit=after-retry').response.status, 200)
 end

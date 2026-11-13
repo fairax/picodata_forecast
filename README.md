@@ -76,6 +76,19 @@ configuration prevents startup. Restart router processes to apply environment
 changes. Cache lookups and writes each have a one-second timeout, separate from
 the upstream request budget.
 
+### Concurrent fetch limit
+
+Each router allows up to 32 simultaneous upstream fetches. Set
+`OPEN_METEO_MAX_CONCURRENT_FETCHES` to a positive integer before starting routers
+to change the limit; restart routers after changes. Cache hits remain available
+when the limit is reached. Additional cache misses immediately return 503
+(`Forecast service busy`), without queuing or contacting upstream.
+
+A fetch occupies a slot through retries and cache insertion. Cancellation does not
+free its slot until the native worker finishes. The limit applies independently
+to each router and bounds concurrent fetches, not total RAM or responses buffered
+for clients. The response body size limit still applies.
+
 ### Upstream body size limit
 
 `OPEN_METEO_MAX_RESPONSE_BYTES` limits upstream response bodies to 1 MiB by default.

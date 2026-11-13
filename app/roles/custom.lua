@@ -5,6 +5,8 @@ local log = require('log')
 
 -- Retain the module so its process-local configuration survives Lua GC.
 local lib
+local max_concurrent_fetches
+local active_fetches = 0
 
 local function cache_get(query, bucket_id)
     local ok, response, err = pcall(require('vshard').router.callrw,
@@ -34,14 +36,34 @@ local function fetch(query)
     local response = cache_get(query, bucket_id)
     if response ~= nil and response ~= box.NULL then return response end
 
-    response = lib:load('fetch_forecast')(query)
-    if response.status >= 200 and response.status < 300 then
-        cache_put(query, bucket_id, response)
+    if active_fetches >= max_concurrent_fetches then
+        return {status = 503, body = 'Forecast service busy', headers = {['content-type'] = 'text/plain'}}
     end
-    return response
+    -- No yield between checking the limit and reserving a permit.
+    active_fetches = active_fetches + 1
+    local ok, result = pcall(function()
+        -- The native call waits for its worker even when this fiber is cancelled.
+        local fetched = lib:load('fetch_forecast')(query)
+        if fetched.status >= 200 and fetched.status < 300 then
+            cache_put(query, bucket_id, fetched)
+        end
+        return fetched
+    end)
+    active_fetches = active_fetches - 1
+    if not ok then error(result, 0) end
+    return result
 end
 
 local function init(opts) -- luacheck: no unused args
+    if max_concurrent_fetches == nil then
+        local value = os.getenv('OPEN_METEO_MAX_CONCURRENT_FETCHES')
+        local limit = value == nil and 32 or tonumber(value)
+        if limit == nil or limit < 1 or limit > 9007199254740991 or limit ~= math.floor(limit)
+            or (value ~= nil and not value:match('^%d+$')) then
+            error('OPEN_METEO_MAX_CONCURRENT_FETCHES must be a positive integer')
+        end
+        max_concurrent_fetches = limit
+    end
     lib = lib or box.lib.load('forecast')
     lib:load('init_forecast')()
 
