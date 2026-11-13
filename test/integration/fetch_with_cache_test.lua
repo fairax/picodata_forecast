@@ -7,12 +7,8 @@ local helper = require('test.helper')
 local g = t.group('integration_fetch_with_cache')
 
 local function fetch(cg, query, async)
-    return cg.cluster.main_server.net_box:eval([[
-        local query = ...
-        local lib = box.lib.load('forecast')
-        local fetch = lib:load('fetch_with_cache')
-        local bucket = box.space._bucket.index.status:select({'active'}, {limit = 1})[1]
-        local ok, response = pcall(fetch, query, assert(bucket).id)
+    return cg.cluster.servers[2].net_box:eval([[
+        local ok, response = pcall(require('app.roles.custom').fetch, ...)
         return {ok = ok, response = ok and response or tostring(response)}
     ]], {query}, {is_async = async or false, timeout = 35})
 end
@@ -25,7 +21,7 @@ end
 
 local function configure(cg, endpoint, timeout, max_bytes)
     timeout = timeout or '30'
-    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+    for _, server in ipairs({cg.cluster.servers[2]}) do
         if server.env.OPEN_METEO_FORECAST_URL ~= endpoint or server.env.OPEN_METEO_TIMEOUT_SECS ~= timeout
             or server.env.OPEN_METEO_MAX_RESPONSE_BYTES ~= max_bytes then
             server:stop()
@@ -143,6 +139,20 @@ g.before_each(function(cg)
 end)
 
 g.after_each(function(cg)
+    if cg.stopped_storage then
+        cg.stopped_storage:start()
+        cg.cluster:wait_until_healthy(cg.stopped_storage)
+        cg.stopped_storage = nil
+    end
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        server.net_box:eval([[
+            local trigger = rawget(_G, 'cache_failure_trigger')
+            if trigger then
+                box.space.forecast_cache:before_replace(nil, trigger)
+                rawset(_G, 'cache_failure_trigger', nil)
+            end
+        ]])
+    end
     cg.gate:close()
     cg.entered:close()
     if cg.tls_listener ~= nil then
@@ -161,17 +171,20 @@ g.test_fetch_yields_and_populates_cache = function(cg)
     local future = fetch(cg, 'b=2&a=1', true)
     t.assert_equals(cg.entered:get(5), true)
     -- The HTTP response remains blocked, but unrelated server fibers must run.
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return 42', {}, {timeout = 1}), 42)
+    t.assert_equals(cg.cluster.servers[2].net_box:eval('return 42', {}, {timeout = 1}), 42)
     t.assert_equals(future:is_ready(), false)
     cg.gate:put(true)
     local response = finish(future)
     t.assert_equals(response.ok, true)
     t.assert_equals(response.response.status, 200)
     t.assert_equals(response.response.body, 'a=1&b=2')
-    local ttl = cg.cluster.main_server.net_box:eval([[
-        local tuple = box.space.forecast_cache:get('a=1&b=2')
-        return tuple[6] - tuple[7]
-    ]])
+    local ttl
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        ttl = server.net_box:eval([[
+            local tuple = box.space.forecast_cache:get('a=1&b=2')
+            if tuple then return tuple[6] - tuple[7] end
+        ]]) or ttl
+    end
     t.assert_equals(ttl, 60000000)
     local cached = fetch(cg, 'a=1&b=2')
     t.assert_equals(cached.ok, true)
@@ -499,7 +512,7 @@ g.test_retry_after_seconds_and_fiber_responsiveness = function(cg)
     cg.actions = {{status = 429, retry_after = '1'}, {status = 200}}
     local future = fetch(cg, 'retry=seconds', true)
     t.assert_equals(cg.entered:get(5), true)
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return 42', {}, {timeout = 0.5}), 42)
+    t.assert_equals(cg.cluster.servers[2].net_box:eval('return 42', {}, {timeout = 0.5}), 42)
     t.assert_equals(future:is_ready(), false)
     t.assert_equals(finish(future).response.status, 200)
     t.assert_equals(cg.requests, 2)
@@ -599,7 +612,7 @@ g.test_invalid_timeout_fails_role_startup = function(cg)
     t.assert_equals(cg.requests, 0)
 end
 
-g.test_defaults_validate_on_master_and_replica = function(cg)
+g.test_defaults_validate_on_router_instances = function(cg)
     t.assert_equals(probe_configuration(nil, nil).ok, true)
     t.assert_equals(probe_configuration(nil, nil, true).ok, true)
     local invalid = probe_configuration(cg.endpoint, '0', true)
@@ -609,17 +622,17 @@ end
 
 g.test_initialized_configuration_is_stable = function(cg)
     cg.auto_respond = true
-    cg.cluster.main_server.net_box:eval([[
+    cg.cluster.servers[2].net_box:eval([[
         os.setenv('OPEN_METEO_FORECAST_URL', 'invalid-after-initialization')
         os.setenv('OPEN_METEO_TIMEOUT_SECS', '0')
         local lib = box.lib.load('forecast')
         lib:load('init_forecast')() -- Explicit initialization is idempotent.
     ]])
-    cg.cluster.main_server.net_box:eval("collectgarbage('collect')")
+    cg.cluster.servers[2].net_box:eval("collectgarbage('collect')")
     local response = fetch(cg, 'configuration=stable')
     t.assert_equals(response.response.status, 200)
     t.assert_equals(cg.requests, 1)
-    cg.cluster.main_server.net_box:eval([[
+    cg.cluster.servers[2].net_box:eval([[
         os.setenv('OPEN_METEO_FORECAST_URL', ...)
         os.setenv('OPEN_METEO_TIMEOUT_SECS', '30')
     ]], {cg.endpoint})
@@ -689,7 +702,7 @@ g.test_chunked_body_limit_and_fiber_responsiveness = function(cg)
     local future = fetch(cg, 'chunked=1', true)
     -- The upstream sends headers then delays its body. Other TX fibers must run.
     fiber.sleep(0.1)
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return 42'), 42)
+    t.assert_equals(cg.cluster.servers[2].net_box:eval('return 42'), 42)
     local response = finish(future)
     t.assert_equals(response.response.status, 502)
     t.assert_equals(response.response.body, 'Forecast response too large')
@@ -698,9 +711,112 @@ end
 
 g.test_body_read_timeout_is_504 = function(cg)
     fault_upstream(cg, 'slow-body')
-    configure(cg, cg.cluster.main_server.env.OPEN_METEO_FORECAST_URL, '1')
+    configure(cg, cg.cluster.servers[2].env.OPEN_METEO_FORECAST_URL, '1')
     local response = fetch(cg, 'body-timeout=1')
     t.assert_equals(response.response.status, 504)
     t.assert_equals(response.response.body, 'Forecast request timed out')
     t.assert_equals(fault_state(cg).count, 1)
+end
+
+local function location(cg, query)
+    local result = cg.cluster.servers[2].net_box:eval([[
+        local router = require('vshard').router
+        local bucket = router.bucket_id_strcrc32(...)
+        return {bucket = bucket, uuid = assert(router.route(bucket)).uuid}
+    ]], {query})
+    local source, destination
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        if server.replicaset_uuid == result.uuid then source = server else destination = server end
+    end
+    return result.bucket, source, destination
+end
+
+g.test_unavailable_storage_still_fetches_upstream = function(cg)
+    cg.auto_respond = true
+    local _, source = location(cg, 'unavailable=1')
+    cg.stopped_storage = source
+    source:stop()
+    local started = fiber.clock()
+    local response = cg.cluster.servers[2]:http_request('get', '/forecast?unavailable=1')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'unavailable=1')
+    t.assert_equals(cg.requests, 1)
+    t.assert(fiber.clock() - started < 4)
+end
+
+g.test_insertion_errors_preserve_upstream_response = function(cg)
+    cg.auto_respond = true
+    for _, code in ipairs({'MEMORY_ISSUE', 'ILLEGAL_PARAMS'}) do
+        for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+            server.net_box:eval([[
+                local code = ...
+                local old = rawget(_G, 'cache_failure_trigger')
+                if old then box.space.forecast_cache:before_replace(nil, old) end
+                local trigger = function() box.error(box.error[code], 'injected cache insertion failure') end
+                rawset(_G, 'cache_failure_trigger', trigger)
+                box.space.forecast_cache:before_replace(trigger)
+            ]], {code})
+        end
+        local query = 'insertion=' .. code
+        local before = cg.requests
+        for _ = 1, 2 do
+            local response = cg.cluster.servers[2]:http_request('get', '/forecast?' .. query)
+            t.assert_equals(response.status, 200)
+            t.assert_equals(response.body, query)
+            t.assert_equals(response.headers['content-type'], 'text/plain')
+            t.assert_equals(response.headers['x-cache'], nil)
+        end
+        t.assert_equals(cg.requests - before, 2)
+    end
+end
+
+g.test_bucket_can_move_while_upstream_fetch_is_pending = function(cg)
+    local query = 'migration=pending'
+    local bucket, source, destination = location(cg, query)
+    local future = fetch(cg, query, true)
+    t.assert_equals(cg.entered:get(5), true)
+    -- The cache lookup must release its bucket reference before fetching.
+    source.net_box:eval([[
+        local bucket, destination = ...
+        local ok, err = require('vshard').storage.bucket_send(bucket, destination)
+        assert(ok, tostring(err))
+    ]], {bucket, destination.replicaset_uuid}, {timeout = 5})
+    cg.gate:put(true)
+    t.assert_equals(finish(future).response.status, 200)
+    local stored = destination.net_box:eval([[
+        local tuple = box.space.forecast_cache:get(...)
+        return tuple and {bucket = tuple[2], body = tuple[4]}
+    ]], {query})
+    t.assert_equals(stored, {bucket = bucket, body = query})
+    t.assert_equals(fetch(cg, query).response.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_expired_response_is_refetched_by_router = function(cg)
+    cg.auto_respond = true
+    local query = 'expired=router'
+    local bucket, source = location(cg, query)
+    source.net_box:eval([[
+        local query, bucket = ...
+        box.space.forecast_cache:replace({query, bucket, 200, 'stale', {type = 'text'}, 0, 0})
+    ]], {query, bucket})
+    local response = fetch(cg, query).response
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, query)
+    t.assert_equals(response.headers['x-cache'], nil)
+    t.assert_equals(fetch(cg, query).response.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_native_fetch_on_router_does_not_access_cache = function(cg)
+    cg.auto_respond = true
+    local response = cg.cluster.servers[2].net_box:eval([[
+        assert(box.space.forecast_cache == nil)
+        return box.lib.load('forecast'):load('fetch_forecast')('native=router')
+    ]])
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'native=router')
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    end
 end

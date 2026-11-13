@@ -30,15 +30,16 @@ curl 'localhost:8081/forecast?latitude=56&longitude=60&current=temperature_2m'
 curl localhost:8081/metrics
 ```
 
-Forecast requests are routed to the storage shard responsible for the normalized
-query and cached there.
+Routers fetch forecasts from Open-Meteo and cache successful responses on the
+storage shard responsible for the normalized query. Cache hits avoid upstream
+requests.
 
 Upstream HTTP responses retain their status, body, and relevant headers, including
 `Content-Type` and `Retry-After`. Only successful (200–299) responses are cached.
 Upstream timeouts return a generic 504 response, connection/TLS failures return 502,
 and internal application failures return 500. Detailed internal errors
-are logged on the server; router-to-storage communication failures return a generic
-502.
+are logged on the server. If storage is unavailable, the router fetches from
+upstream and returns the response without requiring a successful cache write.
 
 Caching is best-effort: cache failures are logged, valid upstream responses are
 still returned, and expired responses are never served. Cache failures can increase
@@ -60,30 +61,31 @@ Cache contents are held only in memory and are not persisted or replicated.
 Restarts and replica promotion can produce cold caches. Cluster metadata remains
 persistent. On upgrade, a legacy persistent cache is recreated as an in-memory
 cache, discarding its contents; historical WAL and snapshot files are not erased.
-Restart storage instances after updating the role or native library.
+Deploy the native library and roles together and restart routers and storage
+instances together; mixed-version operation is not supported.
 
-For example, set the budget before starting the instances:
+For example, set the budget before starting router instances:
 
 ```bash
 export OPEN_METEO_TIMEOUT_SECS=15
 ```
 
 `OPEN_METEO_FORECAST_URL` (default `https://api.open-meteo.com/v1/forecast`) and
-`OPEN_METEO_TIMEOUT_SECS` are validated when the storage role starts. Invalid
-configuration prevents startup. Restart storage processes to apply environment
-changes. The router's RPC timeout is fixed at 35 seconds, so longer HTTP budgets
-can outlive the router's wait.
+`OPEN_METEO_TIMEOUT_SECS` are validated when the router role starts. Invalid
+configuration prevents startup. Restart router processes to apply environment
+changes. Cache lookups and writes each have a one-second timeout, separate from
+the upstream request budget.
 
 ### Upstream body size limit
 
 `OPEN_METEO_MAX_RESPONSE_BYTES` limits upstream response bodies to 1 MiB by default.
-Set a positive integer byte count before starting storage instances, for example:
+Set a positive integer byte count before starting router instances, for example:
 
 ```bash
 export OPEN_METEO_MAX_RESPONSE_BYTES=2097152
 ```
 
-Restart storage instances after changes. The limit also applies after UTF-8 text
+Restart router instances after changes. The limit also applies after UTF-8 text
 conversion. Oversized responses return 502 (`Forecast response too large`) and are
 neither retried nor cached.
 

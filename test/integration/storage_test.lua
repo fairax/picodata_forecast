@@ -1,16 +1,12 @@
 local t = require('luatest')
 local cartridge_helpers = require('cartridge.test-helpers')
 local fio = require('fio')
-local http = require('http.server')
 local helper = require('test.helper')
 local g = t.group('integration_storage')
 
 local function call(cg, name, ...)
     return cg.cluster.main_server.net_box:eval([[
         local name, args = ...
-        if name == 'fetch_with_cache' then
-            table.insert(args, 1) -- Standalone storage tests do not bootstrap vshard.
-        end
         local lib = box.lib.load('forecast')
         local func = lib:load(name)
         return func(unpack(args))
@@ -25,21 +21,14 @@ local function seed_expired(cg, key)
 end
 
 g.before_all(function(cg)
-    cg.mock = http.new('127.0.0.1', 0, {log_requests = false})
-    cg.mock:route({method = 'GET', path = '/forecast'}, function(req)
-        cg.requests = cg.requests + 1
-        cg.last_query = req.query
-        return {status = cg.status, body = cg.body, headers = {['content-type'] = 'application/json'}}
-    end)
-    cg.mock:start()
-    local port = cg.mock.tcp_server:name().port
     cg.cluster = cartridge_helpers.Cluster:new({
         server_command = helper.server_command,
         datadir = fio.pathjoin(helper.datadir, 'storage'),
         base_http_port = 18080,
         base_advertise_port = 18300,
         use_vshard = false,
-        env = {OPEN_METEO_FORECAST_URL = 'http://127.0.0.1:' .. port .. '/forecast'},
+        env = {OPEN_METEO_FORECAST_URL = 'invalid-unused-on-storage',
+            OPEN_METEO_TIMEOUT_SECS = '0', OPEN_METEO_MAX_RESPONSE_BYTES = '0'},
         replicasets = {{
             alias = 'storage',
             uuid = cartridge_helpers.uuid('b'),
@@ -55,15 +44,10 @@ end)
 
 g.after_all(function(cg)
     helper.stop_cluster(cg.cluster)
-    cg.mock:stop()
 end)
 
 g.before_each(function(cg)
     helper.truncate_space_on_cluster(cg.cluster, 'forecast_cache')
-    cg.requests = 0
-    cg.last_query = nil
-    cg.status = 200
-    cg.body = '{"temperature":15}'
 end)
 
 g.after_each(function(cg)
@@ -102,43 +86,40 @@ g.test_schema = function(cg)
     call(cg, 'create_schema') -- Reinitialization must preserve an existing schema.
 end
 
+local function put(cg, query, body)
+    return call(cg, 'cache_put', query, 1, {
+        status = 200, body = body or 'new', headers = {['content-type'] = 'application/json'},
+    })
+end
+
 g.test_put_and_get = function(cg)
-    local fetched = call(cg, 'fetch_with_cache', 'forecast=1')
-    t.assert_equals(fetched.status, 200)
-    t.assert_equals(fetched.body, cg.body)
-    local expected = fetched
-    expected.headers['x-cache'] = 'HIT'
-    t.assert_equals(call(cg, 'fetch_with_cache', 'forecast=1'), expected)
-    t.assert_equals(cg.requests, 1)
+    t.assert_equals(put(cg, 'forecast=1'), true)
+    local response = call(cg, 'cache_get', 'forecast=1')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'new')
+    t.assert_equals(response.headers['x-cache'], 'HIT')
+    local timing = cg.cluster.main_server.net_box:eval([[
+        local tuple = box.space.forecast_cache:get('forecast=1')
+        return {ttl = tuple[6] - tuple[7], bucket = tuple[2]}
+    ]])
+    t.assert(timing.ttl > 59000000 and timing.ttl <= 60000000)
+    t.assert_equals(timing.bucket, 1)
 end
 
-g.test_missing_key_fetches_and_stores = function(cg)
+g.test_missing_key_returns_miss = function(cg)
+    t.assert_equals(call(cg, 'cache_get', 'missing=1'), nil)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
-    t.assert_equals(call(cg, 'fetch_with_cache', 'missing=1').body, cg.body)
-    t.assert_equals(cg.requests, 1)
-    t.assert_equals(cg.last_query, 'missing=1')
-    local tuple = cg.cluster.main_server.net_box:eval("return box.space.forecast_cache:get('missing=1')")
-    t.assert_equals(tuple[4], cg.body)
-end
-
-g.test_refresh_expired_entry = function(cg)
-    seed_expired(cg, 'forecast=1')
-    cg.body = 'new'
-    t.assert_equals(call(cg, 'fetch_with_cache', 'forecast=1').body, 'new')
-    t.assert_equals(cg.requests, 1)
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 1)
-    t.assert_equals(call(cg, 'fetch_with_cache', 'forecast=1').body, 'new')
-    t.assert_equals(cg.requests, 1)
 end
 
 g.test_expired_read_deletes_entry = function(cg)
     seed_expired(cg, 'expired=1')
-    cg.status = 503
-    local response = call(cg, 'fetch_with_cache', 'expired=1')
-    t.assert_equals(response.status, 503)
-    t.assert_equals(response.body, cg.body)
-    t.assert_equals(cg.requests, 3)
+    t.assert_equals(call(cg, 'cache_get', 'expired=1'), nil)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+end
+
+g.test_non_successful_responses_are_not_cached = function(cg)
+    call(cg, 'cache_put', 'error=1', 1, {status = 503, body = 'error', headers = {type = 'text'}})
+    t.assert_equals(call(cg, 'cache_get', 'error=1'), nil)
 end
 
 g.test_background_cleanup_removes_untouched_expired_entries = function(cg)
@@ -146,13 +127,12 @@ g.test_background_cleanup_removes_untouched_expired_entries = function(cg)
     t.helpers.retrying({timeout = 5}, function()
         t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
     end)
-    t.assert_equals(cg.requests, 0)
 end
 
 g.test_insert_does_not_scan_other_expired_entries = function(cg)
     cg.cluster.main_server.net_box:eval("require('app.roles.storage').stop()")
     seed_expired(cg, 'expired=1')
-    call(cg, 'fetch_with_cache', 'fresh=1')
+    put(cg, 'fresh=1')
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 2)
     cg.cluster.main_server.net_box:eval("require('app.roles.storage').apply_config(nil, {is_master = true})")
     t.helpers.retrying({timeout = 5}, function()
@@ -161,7 +141,7 @@ g.test_insert_does_not_scan_other_expired_entries = function(cg)
 end
 
 g.test_restart_discards_cache_contents = function(cg)
-    call(cg, 'fetch_with_cache', 'restart=1')
+    put(cg, 'restart=1')
     local server = cg.cluster.main_server
     server.net_box:eval('box.snapshot()')
     server:stop()
@@ -169,8 +149,7 @@ g.test_restart_discards_cache_contents = function(cg)
     cg.cluster:wait_until_healthy(server)
     t.assert_equals(server.net_box:eval('return box.space.forecast_cache.temporary'), true)
     t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
-    t.assert_equals(call(cg, 'fetch_with_cache', 'restart=1').status, 200)
-    t.assert_equals(cg.requests, 2)
+    t.assert_equals(put(cg, 'restart=1'), true)
 end
 
 g.test_schema_migrates_persistent_cache_and_preserves_temporary_cache = function(cg)
@@ -184,73 +163,68 @@ g.test_schema_migrates_persistent_cache_and_preserves_temporary_cache = function
     call(cg, 'create_schema')
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache.temporary'), true)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
-    call(cg, 'fetch_with_cache', 'preserve=1')
+    put(cg, 'preserve=1')
     call(cg, 'create_schema')
-    t.assert_equals(call(cg, 'fetch_with_cache', 'preserve=1').headers['x-cache'], 'HIT')
-    t.assert_equals(cg.requests, 1)
+    t.assert_equals(call(cg, 'cache_get', 'preserve=1').headers['x-cache'], 'HIT')
 end
 
-g.test_insertion_errors_preserve_upstream_and_recover = function(cg)
+g.test_insertion_errors_are_reported_and_recover = function(cg)
     for _, code in ipairs({'MEMORY_ISSUE', 'ILLEGAL_PARAMS'}) do
         cg.cluster.main_server.net_box:eval([[
             local code = ...
             rawset(_G, 'cache_failure_trigger', function() box.error(box.error[code], 'injected cache failure') end)
             box.space.forecast_cache:before_replace(cache_failure_trigger)
         ]], {code})
-        local query = 'insertion=' .. code
-        local response = call(cg, 'fetch_with_cache', query)
-        t.assert_equals(response.status, 200)
-        t.assert_equals(response.body, cg.body)
-        t.assert_equals(response.headers['content-type'], 'application/json')
-        t.assert_equals(response.headers['x-cache'], nil)
+        t.assert_error(function() put(cg, 'insertion=' .. code) end)
         t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
-        local requests = cg.requests
-        call(cg, 'fetch_with_cache', query)
-        t.assert_equals(cg.requests, requests + 1)
         cg.cluster.main_server.net_box:eval([[
             box.space.forecast_cache:before_replace(nil, cache_failure_trigger)
             rawset(_G, 'cache_failure_trigger', nil)
         ]])
     end
-    call(cg, 'fetch_with_cache', 'recovered=1')
-    t.assert_equals(call(cg, 'fetch_with_cache', 'recovered=1').headers['x-cache'], 'HIT')
+    put(cg, 'recovered=1')
+    t.assert_equals(call(cg, 'cache_get', 'recovered=1').headers['x-cache'], 'HIT')
 end
 
 g.test_access_time_failure_serves_cached_response = function(cg)
-    call(cg, 'fetch_with_cache', 'touch=1')
+    put(cg, 'touch=1')
     cg.cluster.main_server.net_box:eval([[
         rawset(_G, 'cache_failure_trigger', function() error('injected touch failure') end)
         box.space.forecast_cache:before_replace(cache_failure_trigger)
     ]])
-    local response = call(cg, 'fetch_with_cache', 'touch=1')
+    local response = call(cg, 'cache_get', 'touch=1')
     t.assert_equals(response.status, 200)
-    t.assert_equals(response.body, cg.body)
+    t.assert_equals(response.body, 'new')
     t.assert_equals(response.headers['x-cache'], 'HIT')
-    t.assert_equals(cg.requests, 1)
 end
 
-g.test_failed_expired_deletion_does_not_serve_stale_response = function(cg)
+g.test_failed_expired_deletion_returns_miss = function(cg)
     cg.cluster.main_server.net_box:eval([[
         require('app.roles.storage').stop()
         box.space.forecast_cache:replace({'expired-failure=1', 1, 200, 'stale', {type = 'text'}, 0, 0})
         rawset(_G, 'cache_failure_trigger', function() error('injected cache write failure') end)
         box.space.forecast_cache:before_replace(cache_failure_trigger)
     ]])
-    local response = call(cg, 'fetch_with_cache', 'expired-failure=1')
-    t.assert_equals(response.status, 200)
-    t.assert_equals(response.body, cg.body)
-    t.assert_equals(response.headers['x-cache'], nil)
-    t.assert_equals(cg.requests, 1)
+    t.assert_equals(call(cg, 'cache_get', 'expired-failure=1'), nil)
 end
 
-g.test_missing_cache_space_fetches_upstream = function(cg)
+g.test_missing_cache_space_reports_error = function(cg)
     cg.cluster.main_server.net_box:eval([[
         require('app.roles.storage').stop()
         box.space.forecast_cache:drop()
     ]])
-    local response = call(cg, 'fetch_with_cache', 'missing-space=1')
+    local ok = pcall(call, cg, 'cache_get', 'missing-space=1')
     call(cg, 'create_schema')
-    t.assert_equals(response.status, 200)
-    t.assert_equals(response.body, cg.body)
-    t.assert_equals(cg.requests, 1)
+    t.assert_equals(ok, false)
+end
+
+g.test_cache_hit_updates_access_time = function(cg)
+    put(cg, 'touch=1')
+    cg.cluster.main_server.net_box:eval([[
+        box.space.forecast_cache:update('touch=1', {{'=', 7, 1}})
+    ]])
+    t.assert_equals(call(cg, 'cache_get', 'touch=1').headers['x-cache'], 'HIT')
+    t.assert(cg.cluster.main_server.net_box:eval([[
+        return box.space.forecast_cache:get('touch=1')[7]
+    ]]) > 1)
 end

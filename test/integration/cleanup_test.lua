@@ -9,18 +9,12 @@ local function eval(cg, code, args)
 end
 
 g.before_all(function(cg)
-    cg.mock = require('http.server').new('127.0.0.1', 0, {log_requests = false})
-    cg.mock:route({method = 'GET', path = '/forecast'}, function()
-        return {status = 200, body = 'promoted'}
-    end)
-    cg.mock:start()
     cg.cluster = cartridge_helpers.Cluster:new({
         server_command = helper.server_command,
         datadir = fio.pathjoin(helper.datadir, 'cleanup'),
         base_http_port = 58080,
         base_advertise_port = 58300,
         use_vshard = false,
-        env = {OPEN_METEO_FORECAST_URL = 'http://127.0.0.1:' .. cg.mock.tcp_server:name().port .. '/forecast'},
         replicasets = {{alias = 'cleanup', roles = {'app.roles.storage'}, servers = {
             {alias = 'cleanup'}, {alias = 'cleanup-replica'},
         }}},
@@ -30,7 +24,6 @@ end)
 
 g.after_all(function(cg)
     helper.stop_cluster(cg.cluster)
-    cg.mock:stop()
 end)
 
 g.before_each(function(cg)
@@ -163,10 +156,8 @@ g.test_real_promotion_moves_cleanup_to_new_master = function(cg)
     end)
     local response = replica.net_box:eval([[
         local lib = box.lib.load('forecast')
-        local fetch = lib:load('fetch_with_cache')
-        local response = fetch('promotion-hit', 1)
-        assert(response.status == 200 and response.headers['x-cache'] == nil)
-        return fetch('promotion-hit', 1)
+        lib:load('cache_put')('promotion-hit', 1, {status = 200, body = 'promoted', headers = {type = 'text'}})
+        return lib:load('cache_get')('promotion-hit')
     ]])
     t.assert_equals(response.body, 'promoted')
     t.assert_equals(response.headers['x-cache'], 'HIT')
@@ -346,7 +337,7 @@ g.test_eviction_batches_and_lru_order = function(cg)
         end
         local lib = box.lib.load('forecast')
         -- Accessing the oldest entry moves it to the end of the LRU index.
-        lib:load('fetch_with_cache')('001', 1)
+        lib:load('cache_get')('001')
         local evict = lib:load('evict_cache')
         local fiber = require('fiber')
         local before = fiber.info()[fiber.self():id()].csw

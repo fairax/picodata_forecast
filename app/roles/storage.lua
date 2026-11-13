@@ -114,11 +114,11 @@ end
 
 local function init(opts) -- luacheck: no unused args
     lib = lib or box.lib.load('forecast')
-    lib:load('init_forecast')()
     if not opts.is_master then return true end
     local create_schema = lib:load('create_schema')
     create_schema()
-    box.schema.func.create('forecast.fetch_with_cache', {language = 'C', if_not_exists = true})
+    box.schema.func.create('forecast.cache_get', {language = 'C', if_not_exists = true})
+    box.schema.func.create('forecast.cache_put', {language = 'C', if_not_exists = true})
 
     return true
 end
@@ -128,8 +128,10 @@ return {
     init = init,
     apply_config = apply_config,
     stop = stop,
-    fetch_with_cache = function(query, bucket_id)
-        local fetch = lib:load('fetch_with_cache')
-        return fetch(query, bucket_id)
+    cache_get = function(query)
+        return lib:load('cache_get')(query)
+    end,
+    cache_put = function(query, bucket_id, response)
+        return lib:load('cache_put')(query, bucket_id, response)
     end,
 }

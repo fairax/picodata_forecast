@@ -37,21 +37,14 @@ fn normalize_query(query: &str) -> String {
 }
 
 #[proc]
-fn fetch_with_cache(query: &str, bucket_id: u64) -> Result<forecast::Response> {
+fn fetch_forecast(query: &str) -> Result<forecast::Response> {
     use forecast::FetchError;
 
     let result = (|| -> std::result::Result<forecast::Response, FetchError> {
         let normalized_query = forecast::NormalizedQuery::new(query);
-        match storage::get_cache_entry(&normalized_query) {
-            Ok(Some(response)) => return Ok(response),
-            Ok(None) => {}
-            Err(error) => tarantool::say_error!("Cache lookup failed: {}", error),
-        }
-
-        let cache_key = normalized_query.to_string();
         let output = Arc::new(Mutex::new(None));
         let worker_output = Arc::clone(&output);
-        // Only owned query/response data crosses threads. Cache access stays here.
+        // Only owned query/response data crosses threads; the worker makes no Tarantool calls.
         let mut worker = move |query: Box<forecast::NormalizedQuery>| {
             let result = std::panic::catch_unwind(|| forecast::fetch(&query))
                 .unwrap_or_else(|_| Err(FetchError::internal("Forecast HTTP worker panicked")));
@@ -73,18 +66,25 @@ fn fetch_with_cache(query: &str, bucket_id: u64) -> Result<forecast::Response> {
             .map_err(|_| FetchError::internal("Forecast result mutex poisoned"))?
             .take()
             .ok_or_else(|| FetchError::internal("Forecast HTTP worker returned no result"))??;
-        if !(200..300).contains(&response.status) {
-            return Ok(response);
-        }
-        if let Err(error) = storage::add_cache_entry(
-            cache_key,
-            bucket_id,
-            &response,
-            std::time::Duration::from_secs(60),
-        ) {
-            tarantool::say_error!("Cache insertion failed: {}", error);
-        }
         Ok(response)
     })();
     Ok(result.unwrap_or_else(forecast::Response::from))
+}
+
+#[proc]
+fn cache_get(query: &str) -> Result<Option<forecast::Response>> {
+    storage::get_cache_entry(&forecast::NormalizedQuery::new(query))
+}
+
+#[proc]
+fn cache_put(query: &str, bucket_id: u64, response: forecast::Response) -> Result<bool> {
+    if (200..300).contains(&response.status) {
+        storage::add_cache_entry(
+            forecast::NormalizedQuery::new(query).to_string(),
+            bucket_id,
+            &response,
+            std::time::Duration::from_secs(60),
+        )?;
+    }
+    Ok(true)
 }
