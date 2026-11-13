@@ -158,6 +158,10 @@ g.after_each(function(cg)
     end
     cg.gate:close()
     cg.entered:close()
+    if cg.header_listener ~= nil then
+        cg.header_listener:close()
+        cg.header_listener = nil
+    end
     if cg.tls_listener ~= nil then
         cg.tls_listener:close()
         cg.tls_listener = nil
@@ -909,4 +913,74 @@ g.test_fetch_limit_holds_permit_across_retries = function(cg)
     t.assert_equals(finish(pending).response.status, 200)
     cg.auto_respond = true
     t.assert_equals(fetch(cg, 'limit=after-retry').response.status, 200)
+end
+
+g.test_connection_headers_removed_from_upstream_and_cache_hits = function(cg)
+    -- Use a raw server: http.server replaces Connection with its own value.
+    cg.header_listener = assert(require('socket').tcp_server('127.0.0.1', 0, function(connection)
+        if not connection:read({delimiter = '\r\n\r\n'}, 5) then return end
+        cg.requests = cg.requests + 1
+        local body = 'headers=upstream'
+        connection:write(table.concat({
+            'HTTP/1.1 200 OK',
+            'Content-Length: ' .. #body,
+            'Content-Type: text/plain',
+            'Retry-After: 0',
+            'Connection: close, X-Private-Hop,  x-SECOND-Hop  ',
+            'Keep-Alive: timeout=5',
+            'Proxy-Connection: keep-alive',
+            'TE: trailers',
+            'Trailer: x-trailer',
+            'Upgrade: example',
+            'X-Private-Hop: private',
+            'X-Second-Hop: also private',
+            'X-End-To-End: preserved',
+            '', body,
+        }, '\r\n'))
+    end))
+    configure(cg, 'http://127.0.0.1:' .. cg.header_listener:name().port .. '/forecast')
+    local router = cg.cluster.servers[2]
+    for attempt = 1, 2 do
+        local response = router:http_request('get', '/forecast?headers=upstream')
+        t.assert_equals(response.status, 200)
+        t.assert_equals(response.body, 'headers=upstream')
+        for _, name in ipairs({'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade',
+            'x-private-hop', 'x-second-hop'}) do
+            t.assert_equals(response.headers[name], nil)
+        end
+        t.assert_equals(response.headers['content-type'], 'text/plain')
+        t.assert_equals(response.headers['retry-after'], '0')
+        t.assert_equals(response.headers['x-end-to-end'], 'preserved')
+        if attempt == 2 then t.assert_equals(response.headers['x-cache'], 'HIT') end
+    end
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_cached_headers_filtered_case_insensitively = function(cg)
+    local query = 'headers=mixed'
+    local bucket, source = location(cg, query)
+    source.net_box:eval([[
+        local query, bucket = ...
+        box.lib.load('forecast'):load('cache_put')(query, bucket, {
+            status = 200, body = 'cached', headers = {
+                CoNnEcTiOn = ' X-First, , x-SECOND  ',
+                ['X-FIRST'] = 'private', ['x-Second'] = 'private',
+                ['KeEp-AlIvE'] = 'timeout=5', ['PrOxY-CoNnEcTiOn'] = 'keep-alive',
+                Te = 'trailers', TrAiLeR = 'x-trailer', UpGrAdE = 'example',
+                ['TrAnSfEr-EnCoDiNg'] = 'chunked', ['CoNtEnT-LeNgTh'] = '999',
+                ['Content-Type'] = 'text/plain', ['Retry-After'] = '7',
+            },
+        })
+    ]], {query, bucket})
+    local response = cg.cluster.servers[2]:http_request('get', '/forecast?' .. query)
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'cached')
+    for _, name in ipairs({'x-first', 'x-second', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade'}) do
+        t.assert_equals(response.headers[name], nil)
+    end
+    t.assert(response.headers['content-length'] ~= '999')
+    t.assert_equals(response.headers['content-type'], 'text/plain')
+    t.assert_equals(response.headers['retry-after'], '7')
+    t.assert_equals(response.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 0)
 end

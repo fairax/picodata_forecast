@@ -54,6 +54,33 @@ local function fetch(query)
     return result
 end
 
+local function filter_headers(headers)
+    headers = headers or {}
+    local excluded = {
+        connection = true,
+        ['keep-alive'] = true,
+        ['proxy-connection'] = true,
+        te = true,
+        trailer = true,
+        ['transfer-encoding'] = true,
+        upgrade = true,
+        -- The HTTP server supplies framing for the returned body.
+        ['content-length'] = true,
+    }
+    for name, value in pairs(headers) do
+        if name:lower() == 'connection' then
+            for token in value:gmatch('[^,]+') do
+                excluded[token:match('^%s*(.-)%s*$'):lower()] = true
+            end
+        end
+    end
+    local filtered = {}
+    for name, value in pairs(headers) do
+        if not excluded[name:lower()] then filtered[name] = value end
+    end
+    return filtered
+end
+
 local function init(opts) -- luacheck: no unused args
     if max_concurrent_fetches == nil then
         local value = os.getenv('OPEN_METEO_MAX_CONCURRENT_FETCHES')
@@ -71,12 +98,7 @@ local function init(opts) -- luacheck: no unused args
     httpd:route({method = 'GET', path = '/forecast'}, function(request)
         local response = fetch(request.query or '')
 
-        -- The HTTP server supplies framing for the returned body.
-        local headers = response.headers or {}
-        headers['content-length'] = nil
-        headers['transfer-encoding'] = nil
-        headers.connection = nil
-        return {status = response.status, body = response.body, headers = headers}
+        return {status = response.status, body = response.body, headers = filter_headers(response.headers)}
     end)
 
     return true
