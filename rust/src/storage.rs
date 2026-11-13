@@ -279,3 +279,63 @@ pub fn cleanup_expired(cursor: Option<CleanupCursor>) -> Result<CleanupBatch> {
     }
     Ok(batch)
 }
+
+/// Evict up to 100 LRU candidates without yielding, until live usage reaches target.
+/// This cursor uses (last_access, key), independently of the expiration cursor.
+pub fn evict_cache(cursor: Option<CleanupCursor>, target_bytes: u64) -> Result<CleanupBatch> {
+    let mut batch = CleanupBatch {
+        scanned: 0,
+        deleted: 0,
+        next_cursor: None,
+    };
+    let lua = tarantool::lua_state();
+    if lua.eval::<bool>("return box.info.ro")? {
+        return Ok(batch);
+    }
+    let space = forecast_cache()?;
+    let index = space.index("lru").ok_or("Missing cache index: lru")?;
+    let mut iterator = match cursor {
+        Some(cursor) => index.select(IteratorType::GT, &cursor)?,
+        None => index.select(IteratorType::GE, &())?,
+    };
+    let sharded: bool = lua.eval("return box.space._bucket ~= nil")?;
+    while batch.scanned < 100 {
+        // box.info.memory() yields to collect network stats. These slab fields
+        // give the same live memtx tuple/index bytes without crossing threads.
+        let used: u64 = lua.eval(
+            "local s = box.slab.info(); return s.arena_used + \
+             (box.cfg.memtx_allocator == 'system' and s.items_used or 0)",
+        )?;
+        if used <= target_bytes {
+            break;
+        }
+        let Some(tuple) = iterator.next() else {
+            break;
+        };
+        let entry = CacheEntry(&tuple);
+        let key = entry.key()?;
+        let bucket_id = entry.bucket_id()?;
+        let last_access: u64 = entry.field(6, "last_access")?;
+        batch.scanned += 1;
+        if batch.scanned == 100 {
+            batch.next_cursor = Some((last_access, key.clone()));
+        }
+        // Do not pin deleted tuples while measuring memory on the next iteration.
+        drop(tuple);
+        let Some(reference) = BucketRef::acquire(bucket_id, sharded)? else {
+            continue;
+        };
+        let deletion = space.delete(&(key.as_str(),));
+        reference.release()?;
+        match deletion {
+            Ok(tuple) => batch.deleted += usize::from(tuple.is_some()),
+            Err(error) => {
+                if lua.eval::<bool>("return box.info.ro")? {
+                    break;
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(batch)
+}

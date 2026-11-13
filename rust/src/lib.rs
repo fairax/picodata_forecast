@@ -24,6 +24,14 @@ fn cleanup_expired(cursor: Option<storage::CleanupCursor>) -> Result<storage::Cl
 }
 
 #[proc]
+fn evict_cache(
+    cursor: Option<storage::CleanupCursor>,
+    target_bytes: u64,
+) -> Result<storage::CleanupBatch> {
+    storage::evict_cache(cursor, target_bytes)
+}
+
+#[proc]
 fn normalize_query(query: &str) -> String {
     forecast::NormalizedQuery::new(query).to_string()
 }

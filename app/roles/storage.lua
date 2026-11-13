@@ -16,6 +16,86 @@ local function stop_cleanup()
     if not ok then log.error('Forecast cleanup stopped with an error: %s', tostring(err)) end
 end
 
+local function start_cleanup()
+    local cleanup = lib:load('cleanup_expired')
+    local evict = lib:load('evict_cache')
+    local task = {running = true}
+    task.fiber = fiber.new(function()
+        local cursor, eviction_cursor, evicting
+        local function reset_eviction()
+            eviction_cursor, evicting = nil, false
+        end
+        local function live_bytes()
+            local memory = box.info.memory()
+            return memory.data + memory.index
+        end
+        local function expiration_step()
+            local batch = cleanup(cursor)
+            cursor = batch.next_cursor ~= box.NULL and batch.next_cursor or nil
+            return cursor ~= nil
+        end
+        local function eviction_step()
+            local low = math.floor(box.cfg.memtx_memory * 0.7)
+            if live_bytes() <= low then
+                reset_eviction()
+                return false
+            end
+            local batch = evict(eviction_cursor, low)
+            eviction_cursor = batch.next_cursor ~= box.NULL and batch.next_cursor or nil
+            if live_bytes() <= low then
+                reset_eviction()
+            elseif eviction_cursor ~= nil then
+                return true
+            end
+            return false
+        end
+        local function sleep(delay)
+            if not task.running then return end
+            task.sleeping = true
+            fiber.sleep(delay)
+            task.sleeping = false
+        end
+        while task.running do
+            local ok, err = pcall(function()
+                while task.running and not box.info.ro do
+                    if not expiration_step() then break end
+                    sleep(0)
+                end
+                if not task.running or box.info.ro then return end
+
+                local high = math.floor(box.cfg.memtx_memory * 0.8)
+                local low = math.floor(box.cfg.memtx_memory * 0.7)
+                local used = live_bytes()
+                if used <= low then
+                    reset_eviction()
+                elseif used >= high then
+                    evicting = true
+                end
+                if evicting then
+                    -- Yield between expiration and the first eviction batch.
+                    sleep(0)
+                    while task.running and not box.info.ro do
+                        if not eviction_step() then break end
+                        sleep(0)
+                    end
+                end
+            end)
+            if not ok then
+                log.error('Forecast cleanup failed: %s', tostring(err))
+            end
+            if not ok or box.info.ro then
+                cursor = nil
+                reset_eviction()
+            end
+            -- A completed sweep or eviction cycle pauses before expiration.
+            sleep(1)
+        end
+    end)
+    task.fiber:name('forecast.cleanup')
+    task.fiber:set_joinable(true)
+    cleanup_task = task
+end
+
 local function apply_config(_, opts)
     if not opts.is_master then
         stop_cleanup()
@@ -23,35 +103,7 @@ local function apply_config(_, opts)
     end
     if cleanup_task ~= nil and cleanup_task.fiber:status() ~= 'dead' then return true end
     stop_cleanup()
-    local cleanup = lib:load('cleanup_expired')
-    local task = {running = true}
-    task.fiber = fiber.new(function()
-        local cursor
-        while task.running do
-            local delay = 1
-            if not box.info.ro then
-                local ok, batch = pcall(cleanup, cursor)
-                if ok then
-                    cursor = batch.next_cursor
-                    if cursor == box.NULL then cursor = nil end
-                    if cursor ~= nil then delay = 0 end
-                else
-                    cursor = nil
-                    log.error('Forecast cleanup failed: %s', tostring(batch))
-                end
-            else
-                cursor = nil
-            end
-            if task.running then
-                task.sleeping = true
-                fiber.sleep(delay)
-                task.sleeping = false
-            end
-        end
-    end)
-    task.fiber:name('forecast.cleanup')
-    task.fiber:set_joinable(true)
-    cleanup_task = task
+    start_cleanup()
     return true
 end
 
