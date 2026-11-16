@@ -2,6 +2,7 @@
 
 local cartridge = require('cartridge')
 local log = require('log')
+local fiber = require('fiber')
 
 -- Retain the module so its process-local configuration survives Lua GC.
 local lib
@@ -40,19 +41,29 @@ local function fetch(query)
     if active_fetches >= max_concurrent_fetches then
         return {status = 503, body = 'Forecast service busy', headers = {['content-type'] = 'text/plain'}}
     end
+    local completion = fiber.channel(1)
     -- No yield between checking the limit and reserving a permit.
     active_fetches = active_fetches + 1
-    local ok, result = pcall(function()
-        -- The native call waits for its worker even when this fiber is cancelled.
-        local fetched = lib:load('fetch_forecast')(query)
-        if fetched.status >= 200 and fetched.status < 300 then
-            cache_put(query, bucket_id, fetched)
-        end
-        return fetched
+    -- SDK 6's I/O executor cannot safely unwind a cancelled fiber. Keep native
+    -- I/O on an independent fiber; caller cancellation must not free its slot.
+    local started, err = pcall(fiber.new, function()
+        local ok, result = pcall(function()
+            local fetched = lib:load('fetch_forecast')(query)
+            if fetched.status >= 200 and fetched.status < 300 and #fetched.body > 0 then
+                cache_put(query, bucket_id, fetched)
+            end
+            return fetched
+        end)
+        active_fetches = active_fetches - 1
+        completion:put({ok = ok, result = result}, 0)
     end)
-    active_fetches = active_fetches - 1
-    if not ok then error(result, 0) end
-    return result
+    if not started then
+        active_fetches = active_fetches - 1
+        error(err, 0)
+    end
+    local outcome = completion:get()
+    if not outcome.ok then error(outcome.result, 0) end
+    return outcome.result
 end
 
 local function filter_headers(headers)

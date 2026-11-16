@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_bytes::ByteBuf;
 use tarantool::space::UpdateOps;
 use tarantool::tuple::Tuple;
 use tarantool::{
@@ -11,15 +12,6 @@ use tarantool::{
 use crate::{Result, forecast::Response};
 
 pub fn create_schema() -> tarantool::Result<()> {
-    // Replace only a legacy persistent cache; temporary cache contents are disposable.
-    let persistent: bool = tarantool::lua_state().eval(
-        "return box.space.forecast_cache ~= nil and not box.space.forecast_cache.temporary",
-    )?;
-    if persistent {
-        if let Some(space) = Space::find("forecast_cache") {
-            space.drop()?;
-        }
-    }
     let space = Space::builder("forecast_cache")
         .space_type(SpaceType::DataTemporary)
         .if_not_exists(true)
@@ -27,7 +19,7 @@ pub fn create_schema() -> tarantool::Result<()> {
             Field::string("key"),
             Field::unsigned("bucket_id"),
             Field::unsigned("status"),
-            Field::string("body"),
+            Field::varbinary("body"),
             Field::map("headers"),
             Field::unsigned("expires_at"),
             Field::unsigned("last_access"),
@@ -155,7 +147,7 @@ impl CacheEntry<'_> {
         self.field(2, "status")
     }
 
-    pub fn body(&self) -> Result<String> {
+    pub fn body(&self) -> Result<ByteBuf> {
         self.field(3, "body")
     }
 

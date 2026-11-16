@@ -19,16 +19,14 @@ local function finish(future)
     return values[1]
 end
 
-local function configure(cg, endpoint, timeout, max_bytes, concurrency)
+local function configure(cg, endpoint, timeout, concurrency)
     timeout = timeout or '30'
     for _, server in ipairs({cg.cluster.servers[2]}) do
         if server.env.OPEN_METEO_FORECAST_URL ~= endpoint or server.env.OPEN_METEO_TIMEOUT_SECS ~= timeout
-            or server.env.OPEN_METEO_MAX_RESPONSE_BYTES ~= max_bytes
             or server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES ~= concurrency then
             server:stop()
             server.env.OPEN_METEO_FORECAST_URL = endpoint
             server.env.OPEN_METEO_TIMEOUT_SECS = timeout
-            server.env.OPEN_METEO_MAX_RESPONSE_BYTES = max_bytes
             server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES = concurrency
             server:start()
             cg.cluster:wait_until_healthy(server)
@@ -36,13 +34,12 @@ local function configure(cg, endpoint, timeout, max_bytes, concurrency)
     end
 end
 
-local function probe_configuration(endpoint, timeout, replica, max_bytes, concurrency)
+local function probe_configuration(endpoint, timeout, replica, concurrency)
     local directory = fio.tempdir()
     local output = fio.pathjoin(directory, 'result.json')
     local env = table.copy(os.environ())
     env.OPEN_METEO_FORECAST_URL = endpoint
     env.OPEN_METEO_TIMEOUT_SECS = timeout
-    env.OPEN_METEO_MAX_RESPONSE_BYTES = max_bytes
     env.OPEN_METEO_MAX_CONCURRENT_FETCHES = concurrency
     local process = require('luatest.process'):start('/usr/local/bin/tarantool', {
         fio.pathjoin(helper.root, 'test', 'fixtures', 'forecast_config_probe.lua'),
@@ -80,7 +77,8 @@ g.before_all(function(cg)
         entered:put(true)
         if not cg.auto_respond and action.gated ~= false then gate:get(40) end
         return {status = status, body = body, headers = {
-            ['content-type'] = 'text/plain', ['retry-after'] = retry_after,
+            ['content-type'] = action.content_type or 'text/plain', ['retry-after'] = retry_after,
+            ['location'] = action.location, ['content-encoding'] = action.content_encoding,
         }}
     end)
     cg.mock:start()
@@ -153,6 +151,7 @@ local function set_router_role(cg, enabled)
 end
 
 g.after_each(function(cg)
+    cg.cluster.servers[2].env.SSL_CERT_FILE = nil
     if cg.router_role_disabled then
         set_router_role(cg, true)
         cg.router_role_disabled = nil
@@ -471,8 +470,11 @@ g.test_cleanup_runs_safely_during_bucket_transfer = function(cg)
     source.net_box:eval([[
         local query, bucket, destination = ...
         local space = box.space.forecast_cache
-        space:replace({query, bucket, 200, 'fresh', {['content-type'] = 'text/plain'}, 9007199254740991, 0})
-        space:replace({'expired-migration', bucket, 200, 'old', {['content-type'] = 'text/plain'}, 0, 0})
+        local binary = require('test.fixtures.binary')
+        local headers = {['content-type'] = 'application/octet-stream'}
+        space:replace({query, bucket, 200, binary('fresh' .. string.char(0, 255, 128)),
+            headers, 9007199254740991, 0})
+        space:replace({'expired-migration', bucket, 200, binary('old'), headers, 0, 0})
         local ok, err = require('vshard').storage.bucket_send(bucket, destination)
         assert(ok, tostring(err))
     ]], {query, location.bucket, destination.replicaset_uuid})
@@ -483,7 +485,8 @@ g.test_cleanup_runs_safely_during_bucket_transfer = function(cg)
     end)
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?' .. query)
     t.assert_equals(response.status, 200)
-    t.assert_equals(response.body, 'fresh')
+    t.assert_equals(response.body, 'fresh' .. string.char(0, 255, 128))
+    t.assert_equals(response.headers['content-type'], 'application/octet-stream')
     t.assert_equals(response.headers['x-cache'], 'HIT')
     t.assert_equals(cg.requests, 0)
 end
@@ -574,6 +577,65 @@ g.test_persistent_connection_reset_stops_after_three_attempts = function(cg)
     t.assert_equals(fault_state(cg).count, 3)
 end
 
+g.test_truncated_body_retries_and_caches_only_complete_response = function(cg)
+    fault_upstream(cg, 'truncated')
+    local router = cg.cluster.servers[2]
+    local response = router:http_request('get', '/forecast?truncated=recovery')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'ok')
+    t.assert_equals(response.headers['x-cache'], nil)
+    t.assert_equals(fault_state(cg).count, 2)
+    local cached = router:http_request('get', '/forecast?truncated=recovery')
+    t.assert_equals(cached.body, 'ok')
+    t.assert_equals(cached.headers['x-cache'], 'HIT')
+    t.assert_equals(fault_state(cg).count, 2)
+end
+
+local function assert_truncated_failure(cg, mode)
+    fault_upstream(cg, mode)
+    local response = cg.cluster.servers[2]:http_request('get', '/forecast?truncated=' .. mode, {raise = false})
+    t.assert_equals(response.status, 502)
+    t.assert_equals(response.body, 'Forecast service unavailable')
+    t.assert_equals(response.headers['x-cache'], nil)
+    t.assert_equals(fault_state(cg).count, 3)
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    end
+end
+
+g.test_truncated_body_is_not_forwarded_or_cached = function(cg)
+    assert_truncated_failure(cg, 'truncated-always')
+end
+
+g.test_truncated_empty_body_is_not_accepted = function(cg)
+    assert_truncated_failure(cg, 'truncated-empty')
+end
+
+g.test_truncated_error_response_is_transport_failure = function(cg)
+    assert_truncated_failure(cg, 'truncated-error')
+end
+
+g.test_truncated_chunked_body_is_not_accepted = function(cg)
+    assert_truncated_failure(cg, 'truncated-chunked')
+end
+
+g.test_not_modified_content_length_is_metadata = function(cg)
+    fault_upstream(cg, 'not-modified')
+    local response = fetch(cg, 'bodyless=304').response
+    t.assert_equals(response.status, 304)
+    t.assert_equals(response.body, '')
+    t.assert_equals(response.headers['content-length'], '20')
+    t.assert_equals(fault_state(cg).count, 1)
+end
+
+g.test_no_content_response_is_not_retried = function(cg)
+    fault_upstream(cg, 'no-content')
+    local response = fetch(cg, 'bodyless=204').response
+    t.assert_equals(response.status, 204)
+    t.assert_equals(response.body, '')
+    t.assert_equals(fault_state(cg).count, 1)
+end
+
 g.test_certificate_validation_failure_is_not_retried = function(cg)
     fault_upstream(cg, 'certificate')
     local response = fetch(cg, 'tls=untrusted-certificate')
@@ -602,7 +664,7 @@ local function set_timeout(cg, value)
     configure(cg, cg.endpoint, value)
 end
 
-g.test_configured_timeout_limits_total_budget = function(cg)
+g.test_configured_timeout_bounds_a_slow_stage = function(cg)
     set_timeout(cg, '1')
     local started = fiber.clock()
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?budget=short', {raise = false})
@@ -660,35 +722,33 @@ g.test_initialized_configuration_is_stable = function(cg)
     ]], {cg.endpoint})
 end
 
-g.test_response_body_limit_boundaries = function(cg)
+g.test_large_response_bodies_are_forwarded = function(cg)
     cg.auto_respond = true
     local router = cg.cluster.servers[2]
-    for _, size in ipairs({1048575, 1048576, 1048577}) do
+    for _, size in ipairs({1048575, 1048576, 1048577, 2097152}) do
         cg.body = string.rep('x', size)
         local before = cg.requests
         local response = router:http_request('get', '/forecast?size=' .. size, {raise = false})
-        if size <= 1048576 then
-            t.assert_equals(response.status, 200)
-            t.assert_equals(response.body, cg.body)
-        else
-            t.assert_equals(response.status, 502)
-            t.assert_equals(response.body, 'Forecast response too large')
-        end
+        t.assert_equals(response.status, 200)
+        t.assert_equals(response.body, cg.body)
+        t.assert_equals(response.headers['content-type'], 'text/plain')
         t.assert_equals(cg.requests, before + 1)
     end
 end
 
-g.test_oversized_errors_are_not_retried_and_smaller_responses_recover = function(cg)
+g.test_large_errors_follow_retry_policy_and_smaller_responses_recover = function(cg)
     cg.auto_respond = true
     local router = cg.cluster.servers[2]
-    for _, status in ipairs({400, 429, 503}) do
+    for _, status in ipairs({400, 429, 502, 503, 504}) do
         cg.status = status
         cg.body = string.rep('x', 1048577)
         local before = cg.requests
         local response = router:http_request('get', '/forecast?overflow=' .. status, {raise = false})
-        t.assert_equals(response.status, 502)
-        t.assert_equals(response.body, 'Forecast response too large')
-        t.assert_equals(cg.requests, before + 1)
+        t.assert_equals(response.status, status)
+        t.assert_equals(response.body, cg.body)
+        t.assert_equals(response.headers['content-type'], 'text/plain')
+        t.assert_equals(response.headers['retry-after'], '0')
+        t.assert_equals(cg.requests, before + (status == 400 and 1 or 3))
     end
     cg.status, cg.body = 200, 'recovered'
     local response = router:http_request('get', '/forecast?overflow=503')
@@ -697,37 +757,103 @@ g.test_oversized_errors_are_not_retried_and_smaller_responses_recover = function
     t.assert_equals(router:http_request('get', '/forecast?overflow=503').headers['x-cache'], 'HIT')
 end
 
-g.test_custom_body_limit_and_utf8_expansion = function(cg)
-    configure(cg, cg.endpoint, '30', '8')
+g.test_response_body_preserves_original_bytes = function(cg)
     cg.auto_respond = true
     local router = cg.cluster.servers[2]
-    for i, body in ipairs({'12345678', '123456789', string.char(255, 255, 255)}) do
+    local bytes = {}
+    for i = 0, 255 do bytes[#bytes + 1] = string.char(i) end
+    for i, body in ipairs({'', table.concat(bytes), string.rep(string.char(255), 1048577)}) do
         cg.body = body
-        local response = router:http_request('get', '/forecast?custom-size=' .. i, {raise = false})
-        t.assert_equals(response.status, i == 1 and 200 or 502)
+        local query = '/forecast?binary=' .. i
+        local before = cg.requests
+        local response = router:http_request('get', query)
+        t.assert_equals(response.status, 200)
+        t.assert_equals(response.body or '', body)
+        t.assert_equals(cg.requests, before + 1)
+        -- Nonempty bodies below memtx_max_tuple_size must hit cache.
+        if #body > 0 and #body < 1048576 then
+            local cached = router:http_request('get', query)
+            t.assert_equals(cached.body or '', body)
+            t.assert_equals(cached.headers['x-cache'], 'HIT')
+            t.assert_equals(cg.requests, before + 1)
+        end
     end
-    t.assert_equals(cg.requests, 3)
 end
 
-g.test_invalid_body_limits_fail_initialization = function(cg)
-    for _, value in ipairs({'', '0', '-1', 'abc', '1.5', string.char(255),
-        '18446744073709551615', '18446744073709551616'}) do
-        local result = probe_configuration(cg.endpoint, '30', false, value)
-        t.assert_equals(result.ok, false)
-        t.assert_str_contains(result.error, 'OPEN_METEO_MAX_RESPONSE_BYTES')
+g.test_empty_responses_are_forwarded_without_caching = function(cg)
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    for _, status in ipairs({200, 204}) do
+        cg.status, cg.body = status, ''
+        local query = '/forecast?empty=' .. status
+        local before = cg.requests
+        for i = 1, 2 do
+            local response = router:http_request('get', query)
+            t.assert_equals(response.status, status)
+            t.assert_equals(response.body or '', '')
+            t.assert_equals(response.headers['x-cache'], nil)
+            t.assert_equals(cg.requests, before + i)
+        end
+        for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+            t.assert_equals(server.net_box:eval('return box.space.forecast_cache:get(...)',
+                {'empty=' .. status}), nil)
+        end
+        cg.status, cg.body = 200, 'recovered'
+        local response = router:http_request('get', query)
+        t.assert_equals(response.body, 'recovered')
+        t.assert_equals(response.headers['x-cache'], nil)
+        local cached = router:http_request('get', query)
+        t.assert_equals(cached.body, 'recovered')
+        t.assert_equals(cached.headers['x-cache'], 'HIT')
+        t.assert_equals(cg.requests, before + 3)
     end
-    t.assert_equals(probe_configuration(cg.endpoint, '30', true, '8').ok, true)
 end
 
-g.test_chunked_body_limit_and_fiber_responsiveness = function(cg)
-    fault_upstream(cg, 'chunked-oversized')
+g.test_compressed_body_is_forwarded_and_cached_without_conversion = function(cg)
+    cg.auto_respond = true
+    -- A complete gzip member representing an empty body.
+    local body = string.char(31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    cg.actions = {{body = body, content_type = 'application/octet-stream', content_encoding = 'gzip'}}
+    local router = cg.cluster.servers[2]
+    for i = 1, 2 do
+        local response = router:http_request('get', '/forecast?compressed=1')
+        t.assert_equals(response.status, 200)
+        t.assert_equals(response.body, body)
+        t.assert_equals(response.headers['content-encoding'], 'gzip')
+        t.assert_equals(response.headers['content-type'], 'application/octet-stream')
+        t.assert_equals(response.headers['x-cache'], i == 2 and 'HIT' or nil)
+    end
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_binary_upstream_errors_preserve_bytes_and_retry_policy = function(cg)
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    local body = string.char(0, 255, 128) .. 'upstream error'
+    for _, status in ipairs({400, 429, 503}) do
+        cg.status, cg.body = status, body
+        local before = cg.requests
+        local response = router:http_request('get', '/forecast?binary-error=' .. status, {raise = false})
+        t.assert_equals(response.status, status)
+        t.assert_equals(response.body, body)
+        t.assert_equals(response.headers['retry-after'], '0')
+        t.assert_equals(cg.requests, before + (status == 400 and 1 or 3))
+    end
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    end
+end
+
+g.test_large_chunked_body_and_fiber_responsiveness = function(cg)
+    fault_upstream(cg, 'chunked-large')
     local future = fetch(cg, 'chunked=1', true)
     -- The upstream sends headers then delays its body. Other TX fibers must run.
     fiber.sleep(0.1)
     t.assert_equals(cg.cluster.servers[2].net_box:eval('return 42'), 42)
     local response = finish(future)
-    t.assert_equals(response.response.status, 502)
-    t.assert_equals(response.response.body, 'Forecast response too large')
+    t.assert_equals(response.ok, true)
+    t.assert_equals(response.response.status, 200)
+    t.assert_equals(response.response.body, string.rep('x', 1048577))
     t.assert_equals(fault_state(cg).count, 1)
 end
 
@@ -820,7 +946,8 @@ g.test_expired_response_is_refetched_by_router = function(cg)
     local bucket, source = location(cg, query)
     source.net_box:eval([[
         local query, bucket = ...
-        box.space.forecast_cache:replace({query, bucket, 200, 'stale', {type = 'text'}, 0, 0})
+        local binary = require('test.fixtures.binary')
+        box.space.forecast_cache:replace({query, bucket, 200, binary('stale'), {type = 'text'}, 0, 0})
     ]], {query, bucket})
     local response = fetch(cg, query).response
     t.assert_equals(response.status, 200)
@@ -844,7 +971,7 @@ g.test_native_fetch_on_router_does_not_access_cache = function(cg)
 end
 
 g.test_fetch_limit_rejects_misses_but_serves_hits = function(cg)
-    configure(cg, cg.endpoint, '30', nil, '2')
+    configure(cg, cg.endpoint, '30', '2')
     cg.auto_respond = true
     t.assert_equals(fetch(cg, 'limit=cached').response.status, 200)
     cg.auto_respond = false
@@ -869,16 +996,16 @@ g.test_fetch_limit_rejects_misses_but_serves_hits = function(cg)
 end
 
 g.test_fetch_limit_configuration = function(cg)
-    t.assert_equals(probe_configuration(cg.endpoint, '30', false, nil, '2').ok, true)
+    t.assert_equals(probe_configuration(cg.endpoint, '30', false, '2').ok, true)
     for _, value in ipairs({'', '0', '-1', '1.5', 'abc', ' 2', '1e2', '9007199254740992'}) do
-        local result = probe_configuration(cg.endpoint, '30', false, nil, value)
+        local result = probe_configuration(cg.endpoint, '30', false, value)
         t.assert_equals(result.ok, false)
         t.assert_str_contains(result.error, 'OPEN_METEO_MAX_CONCURRENT_FETCHES')
     end
 end
 
 g.test_fetch_limit_retains_permit_during_cancellation = function(cg)
-    configure(cg, cg.endpoint, '30', nil, '1')
+    configure(cg, cg.endpoint, '30', '1')
     local router = cg.cluster.servers[2]
     router.net_box:eval([[
         local fiber = require('fiber')
@@ -904,7 +1031,7 @@ g.test_fetch_limit_retains_permit_during_cancellation = function(cg)
 end
 
 g.test_fetch_limit_releases_after_timeout_and_errors = function(cg)
-    configure(cg, cg.endpoint, '1', nil, '1')
+    configure(cg, cg.endpoint, '1', '1')
     t.assert_equals(fetch(cg, 'limit=timeout').response.status, 504)
     cg.auto_respond = true
     cg.status = 400
@@ -914,7 +1041,7 @@ g.test_fetch_limit_releases_after_timeout_and_errors = function(cg)
 end
 
 g.test_fetch_limit_holds_permit_across_retries = function(cg)
-    configure(cg, cg.endpoint, '30', nil, '1')
+    configure(cg, cg.endpoint, '30', '1')
     cg.actions = {{status = 503}, {status = 200}}
     local pending = fetch(cg, 'limit=retry', true)
     t.assert_equals(cg.entered:get(5), true)
@@ -1001,7 +1128,7 @@ g.test_cached_headers_filtered_case_insensitively = function(cg)
 end
 
 g.test_router_role_disable_and_reenable = function(cg)
-    configure(cg, cg.endpoint, '30', nil, '1')
+    configure(cg, cg.endpoint, '30', '1')
     local router = cg.cluster.servers[2]
     cg.auto_respond = true
     t.assert_equals(fetch(cg, 'lifecycle=cached').response.status, 200)
@@ -1042,4 +1169,57 @@ g.test_router_role_disable_and_reenable = function(cg)
         end
         return count
     ]]), 1)
+end
+
+g.test_fiber_http_fetches_run_concurrently = function(cg)
+    local futures = {}
+    for i = 1, 8 do futures[i] = fetch(cg, 'fibreq-parallel=' .. i, true) end
+    for _ = 1, 8 do t.assert_equals(cg.entered:get(3), true) end
+    for _, future in ipairs(futures) do t.assert_equals(future:is_ready(), false) end
+    for _ = 1, 8 do cg.gate:put(true) end
+    for _, future in ipairs(futures) do t.assert_equals(finish(future).response.status, 200) end
+end
+
+g.test_redirect_is_forwarded_without_following = function(cg)
+    cg.auto_respond = true
+    cg.actions = {{status = 302, location = '/forecast?redirected=1', body = 'redirect'}}
+    local response = cg.cluster.servers[2]:http_request('get', '/forecast?redirect=start',
+        {http = {follow_location = false}, raise = false})
+    t.assert_equals(response.status, 302)
+    t.assert_equals(response.body, 'redirect')
+    t.assert_equals(response.headers.location, '/forecast?redirected=1')
+    t.assert_equals(cg.requests, 1)
+    for _, value in pairs(response.headers) do
+        if type(value) == 'string' then t.assert_equals(value:find('[\r\n]'), nil) end
+    end
+end
+
+g.test_redirect_statuses_are_not_followed_retried_or_cached = function(cg)
+    cg.auto_respond = true
+    for _, status in ipairs({301, 302, 303, 307, 308}) do
+        local before = cg.requests
+        local target = '/forecast?redirect=' .. status
+        for i = 1, 2 do
+            cg.actions[before + i] = {status = status, location = target, body = 'redirect body'}
+            local response = fetch(cg, 'redirect=' .. status).response
+            t.assert_equals(response.status, status)
+            t.assert_equals(response.body, 'redirect body')
+            t.assert_equals(response.headers.location, target)
+            t.assert_equals(response.headers['x-cache'], nil)
+            t.assert_equals(cg.requests, before + i)
+        end
+    end
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        t.assert_equals(server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+    end
+end
+
+g.test_fibreq_https_with_trusted_test_certificate = function(cg)
+    fault_upstream(cg, 'certificate')
+    cg.cluster.servers[2].env.SSL_CERT_FILE = fio.pathjoin(cg.fault_directory, 'cert.pem')
+    configure(cg, 'https://localhost:' .. fault_state(cg).port .. '/forecast')
+    local response = fetch(cg, 'tls=trusted').response
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'ok')
+    t.assert_equals(fault_state(cg).count, 1)
 end

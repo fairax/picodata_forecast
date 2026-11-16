@@ -2,6 +2,7 @@ local t = require('luatest')
 local cartridge_helpers = require('cartridge.test-helpers')
 local fio = require('fio')
 local helper = require('test.helper')
+local binary = require('test.fixtures.binary')
 local g = t.group('integration_storage')
 
 local function call(cg, name, ...)
@@ -16,7 +17,8 @@ end
 local function seed_expired(cg, key)
     cg.cluster.main_server.net_box:eval([[
         local key = ...
-        box.space.forecast_cache:replace({key, 1, 200, 'old', {['content-type'] = 'application/json'}, 0, 0})
+        local binary = require('test.fixtures.binary')
+        box.space.forecast_cache:replace({key, 1, 200, binary('old'), {['content-type'] = 'application/json'}, 0, 0})
     ]], {key})
 end
 
@@ -28,7 +30,7 @@ g.before_all(function(cg)
         base_advertise_port = 18300,
         use_vshard = false,
         env = {OPEN_METEO_FORECAST_URL = 'invalid-unused-on-storage',
-            OPEN_METEO_TIMEOUT_SECS = '0', OPEN_METEO_MAX_RESPONSE_BYTES = '0'},
+            OPEN_METEO_TIMEOUT_SECS = '0'},
         replicasets = {{
             alias = 'storage',
             uuid = cartridge_helpers.uuid('b'),
@@ -74,7 +76,7 @@ g.test_schema = function(cg)
         {name = 'key', type = 'string', is_nullable = false},
         {name = 'bucket_id', type = 'unsigned', is_nullable = false},
         {name = 'status', type = 'unsigned', is_nullable = false},
-        {name = 'body', type = 'string', is_nullable = false},
+        {name = 'body', type = 'varbinary', is_nullable = false},
         {name = 'headers', type = 'map', is_nullable = false},
         {name = 'expires_at', type = 'unsigned', is_nullable = false},
         {name = 'last_access', type = 'unsigned', is_nullable = false},
@@ -109,6 +111,43 @@ end
 g.test_missing_key_returns_miss = function(cg)
     t.assert_equals(call(cg, 'cache_get', 'missing=1'), nil)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+end
+
+g.test_binary_body_round_trip = function(cg)
+    local bytes = {}
+    for i = 0, 255 do bytes[#bytes + 1] = string.char(i) end
+    for i, body in ipairs({' ', string.char(0), table.concat(bytes)}) do
+        -- Both Lua byte strings and MessagePack binary procedure inputs are accepted.
+        for j, input in ipairs({body, binary(body)}) do
+            local key = 'binary=' .. i .. '-' .. j
+            t.assert_equals(put(cg, key, input), true)
+            local response = call(cg, 'cache_get', key)
+            t.assert_equals(response.body, body)
+            t.assert_equals(response.headers['x-cache'], 'HIT')
+            local marker = cg.cluster.main_server.net_box:eval([[
+                local msgpack = require('msgpack')
+                local encoded = msgpack.encode(box.space.forecast_cache:get(...))
+                local start = require('ffi').cast('const char *', encoded)
+                local _, after_header = msgpack.decode_array_header(start, #encoded)
+                local offset = tonumber(after_header - start) + 1
+                for _ = 1, 3 do _, offset = msgpack.decode(encoded, offset) end
+                return encoded:byte(offset)
+            ]], {key})
+            t.assert(marker == 0xc4 or marker == 0xc5 or marker == 0xc6)
+        end
+    end
+end
+
+g.test_empty_bodies_skip_insertion_and_preserve_existing_entries = function(cg)
+    for i, body in ipairs({'', binary('')}) do
+        local key = 'empty=' .. i
+        t.assert_equals(put(cg, key, body), true)
+        t.assert_equals(call(cg, 'cache_get', key), nil)
+        t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), i - 1)
+        t.assert_equals(put(cg, key, 'existing'), true)
+        t.assert_equals(put(cg, key, body), true)
+        t.assert_equals(call(cg, 'cache_get', key).body, 'existing')
+    end
 end
 
 g.test_expired_read_deletes_entry = function(cg)
@@ -152,17 +191,7 @@ g.test_restart_discards_cache_contents = function(cg)
     t.assert_equals(put(cg, 'restart=1'), true)
 end
 
-g.test_schema_migrates_persistent_cache_and_preserves_temporary_cache = function(cg)
-    cg.cluster.main_server.net_box:eval([[
-        require('app.roles.storage').stop()
-        box.space.forecast_cache:drop()
-        local space = box.schema.space.create('forecast_cache')
-        space:create_index('primary')
-        space:insert({1, 'legacy'})
-    ]])
-    call(cg, 'create_schema')
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache.temporary'), true)
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
+g.test_schema_initialization_preserves_existing_cache = function(cg)
     put(cg, 'preserve=1')
     call(cg, 'create_schema')
     t.assert_equals(call(cg, 'cache_get', 'preserve=1').headers['x-cache'], 'HIT')
@@ -201,7 +230,8 @@ end
 g.test_failed_expired_deletion_returns_miss = function(cg)
     cg.cluster.main_server.net_box:eval([[
         require('app.roles.storage').stop()
-        box.space.forecast_cache:replace({'expired-failure=1', 1, 200, 'stale', {type = 'text'}, 0, 0})
+        local binary = require('test.fixtures.binary')
+        box.space.forecast_cache:replace({'expired-failure=1', 1, 200, binary('stale'), {type = 'text'}, 0, 0})
         rawset(_G, 'cache_failure_trigger', function() error('injected cache write failure') end)
         box.space.forecast_cache:before_replace(cache_failure_trigger)
     ]])

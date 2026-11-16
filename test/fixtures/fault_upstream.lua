@@ -27,6 +27,7 @@ if mode == 'certificate' then
         int SSL_accept(SSL *ssl);
         int SSL_get_error(const SSL *ssl, int result);
         int SSL_write(SSL *ssl, const void *buffer, int size);
+        int SSL_read(SSL *ssl, void *buffer, int size);
     ]])
     local key = fio.pathjoin(directory, 'key.pem')
     local cert = fio.pathjoin(directory, 'cert.pem')
@@ -77,7 +78,10 @@ local function handle(connection)
         local session = ffi.gc(assert(ssl.SSL_new(context)), ssl.SSL_free)
         assert(ssl.SSL_set_fd(session, connection:fd()) == 1)
         if tls_call(connection, session, ssl.SSL_accept) then
-            tls_call(connection, session, ssl.SSL_write, ok_response, #ok_response)
+            local request = ffi.new('char[4096]')
+            if tls_call(connection, session, ssl.SSL_read, request, 4096) then
+                tls_call(connection, session, ssl.SSL_write, ok_response, #ok_response)
+            end
         end
         ffi.gc(session, nil)
         ssl.SSL_free(session)
@@ -88,11 +92,22 @@ local function handle(connection)
         return
     end
     if not connection:read({delimiter = '\r\n\r\n'}, 5) then return end
-    if mode == 'slow-body' then
+    if mode == 'truncated-always' or mode == 'truncated-empty' or mode == 'truncated-error'
+        or (mode == 'truncated' and count == 1) then
+        local status = mode == 'truncated-error' and '400 Bad Request' or '200 OK'
+        local body = mode == 'truncated-empty' and '' or 'partial'
+        connection:write('HTTP/1.1 ' .. status .. '\r\nContent-Length: 20\r\nConnection: close\r\n\r\n' .. body, 5)
+    elseif mode == 'truncated-chunked' then
+        connection:write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n14\r\npartial', 5)
+    elseif mode == 'not-modified' then
+        connection:write('HTTP/1.1 304 Not Modified\r\nContent-Length: 20\r\nConnection: close\r\n\r\n', 5)
+    elseif mode == 'no-content' then
+        connection:write('HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n', 5)
+    elseif mode == 'slow-body' then
         if not connection:write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n', 5) then return end
         fiber.sleep(2)
         connection:write('ok', 5)
-    elseif mode == 'chunked-oversized' then
+    elseif mode == 'chunked-large' then
         if not connection:write('HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n', 5) then
             return
         end

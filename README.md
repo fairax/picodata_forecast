@@ -17,25 +17,22 @@ Now you can visit http://localhost:8081 and see your application's Admin Web UI.
 **Note**, that application stateboard is always started by default.
 See [`.cartridge.yml`](./.cartridge.yml) file to change this behavior.
 
-## Application
+## Usage
 
-The application entry point is [`init.lua`](./init.lua).
-
-## Roles
-
-The router role, [`app.roles.custom`](./app/roles/custom.lua), exposes `/forecast` for cached forecast requests and `/metrics` for metrics:
+Routers expose `/forecast` for cached forecast requests and `/metrics` for metrics:
 
 ```bash
 curl 'localhost:8081/forecast?latitude=56&longitude=60&current=temperature_2m'
 curl localhost:8081/metrics
 ```
 
-Routers fetch forecasts from Open-Meteo and cache successful responses on the
-storage shard responsible for the normalized query. Cache hits avoid upstream
-requests.
+Routers fetch forecasts from Open-Meteo and cache successful responses for 60 seconds.
+Cache hits avoid upstream requests.
 
 Upstream HTTP responses retain their status, body, and relevant headers, including
-`Content-Type` and `Retry-After`. Only successful (200–299) responses are cached.
+`Content-Type` and `Retry-After`. Only successful (200–299) responses with nonempty
+bodies are cached. Empty responses are returned unchanged.
+Bodies are preserved byte-for-byte, including non-UTF-8 and compressed data.
 Upstream timeouts return a generic 504 response, connection/TLS failures return 502,
 and internal application failures return 500. Detailed internal errors
 are logged on the server. If storage is unavailable, the router fetches from
@@ -46,23 +43,25 @@ still returned, and expired responses are never served. Cache failures can incre
 upstream traffic.
 
 Forecast fetching retries temporary transport failures and HTTP 429, 502, 503, and
-504 up to three attempts within `OPEN_METEO_TIMEOUT_SECS` (default 30 seconds).
-Each attempt is capped at 10 seconds. Retries respect `Retry-After` when the delay
-fits within the remaining budget. Certificate validation failures and other HTTP
-errors are not retried.
+504, with at most three attempts. Retries respect `Retry-After` when the delay
+fits within the configured budget. Certificate validation failures and other HTTP
+errors are not retried. Redirect responses are returned to the client without being followed.
 
-Expired entries are removed automatically on writable storage masters. Under memory
+Expired entries are removed automatically. Under memory
 pressure, least recently used entries may be evicted, including unexpired entries.
 Eviction starts at 80% of the instance's configured memtx memory and targets 70%,
-measured using live tuple and index bytes. These thresholds do not cap process RAM
+based on estimated live data usage. These thresholds do not cap process RAM
 or guarantee that writes cannot run out of memory.
 
 Cache contents are held only in memory and are not persisted or replicated.
 Restarts and replica promotion can produce cold caches. Cluster metadata remains
-persistent. On upgrade, a legacy persistent cache is recreated as an in-memory
-cache, discarding its contents; historical WAL and snapshot files are not erased.
-Deploy the native library and roles together and restart routers and storage
-instances together; mixed-version operation is not supported.
+persistent.
+
+### Upstream configuration
+
+`OPEN_METEO_TIMEOUT_SECS` sets the retry budget in positive integer seconds
+(default 30). Requests can exceed this budget because connection and response
+timeouts apply separately; it is not a strict end-to-end deadline.
 
 For example, set the budget before starting router instances:
 
@@ -84,23 +83,32 @@ to change the limit; restart routers after changes. Cache hits remain available
 when the limit is reached. Additional cache misses immediately return 503
 (`Forecast service busy`), without queuing or contacting upstream.
 
-A fetch occupies a slot through retries and cache insertion. Cancellation does not
-free its slot until the native worker finishes. The limit applies independently
-to each router and bounds concurrent fetches, not total RAM or responses buffered
-for clients. The response body size limit still applies.
+A fetch occupies a slot through retries and cache insertion. Disconnecting a client
+does not stop its ongoing fetch or immediately free its slot. The limit applies
+independently to each router and does not cap total memory usage.
 
-### Upstream body size limit
+### Known issues
 
-`OPEN_METEO_MAX_RESPONSE_BYTES` limits upstream response bodies to 1 MiB by default.
-Set a positive integer byte count before starting router instances, for example:
+**Unbounded response buffering.**
+Complete upstream response bodies are buffered without a size limit.
+Large responses can exhaust process memory despite the concurrent fetch limit
+and cache eviction. Cache insertion remains best-effort: if a response cannot be
+cached, it is still returned to the client.
 
-```bash
-export OPEN_METEO_MAX_RESPONSE_BYTES=2097152
-```
+**Bodies delimited by connection closure are lost.** Upstream responses without
+`Content-Length` or chunked transfer encoding are returned with an empty body,
+even when the upstream sends content before closing the connection.
 
-Restart router instances after changes. The limit also applies after UTF-8 text
-conversion. Oversized responses return 502 (`Forecast response too large`) and are
-neither retried nor cached.
+**Informational responses replace the final response.** If an upstream sends
+a 1xx response, such as `103 Early Hints`, before its final response, the proxy
+returns the informational status with an empty body. The final status and body
+are lost, so clients may never receive a final response.
+
+**Cache entries are shared across upstream URLs.** Changing
+`OPEN_METEO_FORECAST_URL` and restarting a router does not invalidate existing
+cache entries. The same query can return a response from the previous upstream
+until it expires. Routers using different upstream URLs also share cached responses
+for matching queries.
 
 ## Instances configuration
 
@@ -149,8 +157,8 @@ To run the forecast routing and cache integration tests:
 .rocks/bin/luatest -v test/integration/fetch_with_cache_test.lua
 ```
 
-Transport tests require `openssl` on `PATH`. The timeout test uses the full
-30-second request budget.
+Building requires a C compiler, Make, and Perl. Transport tests require `openssl`
+on `PATH`. The slow-upstream timeout test exercises the default 30-second retry budget.
 
 ## Admin
 

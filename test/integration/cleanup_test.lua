@@ -5,7 +5,7 @@ local helper = require('test.helper')
 local g = t.group('integration_cleanup')
 
 local function eval(cg, code, args)
-    return cg.cluster.main_server.net_box:eval(code, args)
+    return cg.cluster.main_server.net_box:eval("local binary = require('test.fixtures.binary'); " .. code, args)
 end
 
 g.before_all(function(cg)
@@ -67,9 +67,9 @@ g.test_batch_bound_and_continuation = function(cg)
     local result = eval(cg, [[
         local space = box.space.forecast_cache
         for i = 1, 250 do
-            space:replace({string.format('%03d', i), 1, 200, 'old', {type = 'text'}, 0, 0})
+            space:replace({string.format('%03d', i), 1, 200, binary('old'), {type = 'text'}, 0, 0})
         end
-        space:replace({'fresh', 1, 200, 'new', {type = 'text'}, 9007199254740991, 0})
+        space:replace({'fresh', 1, 200, binary('new'), {type = 'text'}, 9007199254740991, 0})
         local lib = box.lib.load('forecast')
         local cleanup = lib:load('cleanup_expired')
         local first = cleanup(nil)
@@ -92,7 +92,7 @@ g.test_read_only_pauses_cleanup = function(cg)
     local result = eval(cg, [[
         local role = require('app.roles.storage')
         local space = box.space.forecast_cache
-        space:replace({'readonly', 1, 200, 'old', {type = 'text'}, 0, 0})
+        space:replace({'readonly', 1, 200, binary('old'), {type = 'text'}, 0, 0})
         box.cfg({read_only = true})
         role.apply_config(nil, {is_master = true})
         require('fiber').sleep(0.1)
@@ -111,7 +111,7 @@ end
 g.test_background_recovers_after_cleanup_error = function(cg)
     eval(cg, [[
         local space = box.space.forecast_cache
-        space:replace({'retry', 1, 200, 'old', {type = 'text'}, 0, 0})
+        space:replace({'retry', 1, 200, binary('old'), {type = 'text'}, 0, 0})
         cleanup_test_state.trigger = function(_, new)
             if new == nil then error('temporary cleanup error') end
         end
@@ -129,7 +129,7 @@ end
 
 g.test_real_promotion_moves_cleanup_to_new_master = function(cg)
     eval(cg, [[
-        box.space.forecast_cache:replace({'promotion', 1, 200, 'old', {type = 'text'}, 0, 0})
+        box.space.forecast_cache:replace({'promotion', 1, 200, binary('old'), {type = 'text'}, 0, 0})
     ]])
     local replica = cg.cluster.servers[2]
     t.assert_equals(replica.net_box:eval("return box.space.forecast_cache:get('promotion')"), nil)
@@ -184,7 +184,7 @@ end
 g.test_skipped_buckets_do_not_starve_later_candidates = function(cg)
     local result = eval(cg, sharded_setup() .. [[
         for i = 1, 150 do
-            space:replace({string.format('%03d', i), i <= 100 and 1 or 2, 200, 'old', {type = 'text'}, 0, 0})
+            space:replace({string.format('%03d', i), i <= 100 and 1 or 2, 200, binary('old'), {type = 'text'}, 0, 0})
         end
         storage.bucket_refrw = function(id)
             if id == 1 then return nil, 'moving' end
@@ -207,7 +207,7 @@ g.test_batch_does_not_yield = function(cg)
     local result = eval(cg, [[
         local space = box.space.forecast_cache
         for i = 1, 100 do
-            space:replace({tostring(i), 1, 200, 'old', {type = 'text'}, 0, 0})
+            space:replace({tostring(i), 1, 200, binary('old'), {type = 'text'}, 0, 0})
         end
         local fiber = require('fiber')
         local before = assert(fiber.info()[fiber.self():id()].csw)
@@ -221,7 +221,7 @@ end
 
 g.test_delete_error_releases_reference = function(cg)
     local result = eval(cg, sharded_setup() .. [[
-        space:replace({'failure', 1, 200, 'old', {type = 'text'}, 0, 0})
+        space:replace({'failure', 1, 200, binary('old'), {type = 'text'}, 0, 0})
         storage.bucket_refrw = function() state.held = state.held + 1; return true end
         state.trigger = function(_, new)
             if new == nil then error('injected delete failure') end
@@ -239,7 +239,7 @@ end
 g.test_demotion_during_cleanup_stops_batch_quietly = function(cg)
     local result = eval(cg, sharded_setup() .. [[
         for _, key in ipairs({'first', 'second'}) do
-            space:replace({key, 1, 200, 'old', {type = 'text'}, 0, 0})
+            space:replace({key, 1, 200, binary('old'), {type = 'text'}, 0, 0})
         end
         state.trigger = function(_, new)
             if new == nil then error('injected deletion failure after demotion') end
@@ -261,7 +261,7 @@ end
 
 g.test_release_error_is_not_hidden_by_demotion = function(cg)
     local result = eval(cg, sharded_setup() .. [[
-        space:replace({'failure', 1, 200, 'old', {type = 'text'}, 0, 0})
+        space:replace({'failure', 1, 200, binary('old'), {type = 'text'}, 0, 0})
         storage.bucket_refrw = function()
             state.held = state.held + 1
             box.cfg({read_only = true})
@@ -312,7 +312,7 @@ g.test_backlog_yields_and_drains_in_background = function(cg)
         local role = require('app.roles.storage')
         local fiber = require('fiber')
         local space = box.space.forecast_cache
-        for i = 1, 350 do space:replace({tostring(i), 1, 200, 'old', {type = 'text'}, 0, 0}) end
+        for i = 1, 350 do space:replace({tostring(i), 1, 200, binary('old'), {type = 'text'}, 0, 0}) end
         local ticks = 0
         local running = true
         local heartbeat = fiber.new(function() while running do ticks = ticks + 1; fiber.sleep(0) end end)
@@ -333,7 +333,7 @@ g.test_eviction_batches_and_lru_order = function(cg)
     local result = eval(cg, [[
         local space = box.space.forecast_cache
         for i = 1, 250 do
-            space:replace({string.format('%03d=', i), 1, 200, 'fresh', {type = 'text'}, 9007199254740991, i})
+            space:replace({string.format('%03d=', i), 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, i})
         end
         local lib = box.lib.load('forecast')
         -- Accessing the oldest entry moves it to the end of the LRU index.
@@ -366,7 +366,7 @@ g.test_eviction_releases_memory_and_stops_at_target = function(cg)
         local function used() local m = box.info.memory(); return m.data + m.index end
         local baseline = used()
         for i = 1, 40 do
-            space:replace({tostring(i), 1, 200, string.rep('x', 32768), {type = 'text'}, 9007199254740991, i})
+            space:replace({tostring(i), 1, 200, binary(string.rep('x', 32768)), {type = 'text'}, 9007199254740991, i})
         end
         collectgarbage('collect')
         local before = used()
@@ -386,7 +386,7 @@ end
 g.test_eviction_skips_buckets_and_retries_next_sweep = function(cg)
     local result = eval(cg, sharded_setup() .. [[
         for i = 1, 150 do
-            space:replace({string.format('%03d', i), i <= 100 and 1 or 2, 200, 'fresh',
+            space:replace({string.format('%03d', i), i <= 100 and 1 or 2, 200, binary('fresh'),
                 {type = 'text'}, 9007199254740991, i})
         end
         storage.bucket_refrw = function(id)
@@ -411,7 +411,7 @@ end
 
 g.test_eviction_error_releases_reference = function(cg)
     local result = eval(cg, sharded_setup() .. [[
-        space:replace({'evict-error', 1, 200, 'fresh', {type = 'text'}, 9007199254740991, 0})
+        space:replace({'evict-error', 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, 0})
         storage.bucket_refrw = function() state.held = state.held + 1; return true end
         state.trigger = function() error('injected eviction error') end
         space:before_replace(state.trigger)
@@ -430,7 +430,7 @@ g.test_eviction_hysteresis_and_fiber_progress = function(cg)
         local fiber = require('fiber')
         local space = box.space.forecast_cache
         for i = 1, 200 do
-            space:replace({tostring(i), 1, 200, 'fresh', {type = 'text'}, 9007199254740991, i})
+            space:replace({tostring(i), 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, i})
         end
         local high = math.floor(box.cfg.memtx_memory * 0.8)
         local low = math.floor(box.cfg.memtx_memory * 0.7)
@@ -472,7 +472,7 @@ end
 
 g.test_unreclaimable_eviction_sleeps_and_recovers = function(cg)
     local result = eval(cg, sharded_setup() .. [[
-        space:replace({'locked', 1, 200, 'fresh', {type = 'text'}, 9007199254740991, 0})
+        space:replace({'locked', 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, 0})
         local attempts, available = 0, false
         storage.bucket_refrw = function()
             attempts = attempts + 1
@@ -509,7 +509,7 @@ g.test_eviction_read_only_and_demotion_reset_hysteresis = function(cg)
     local result = eval(cg, sharded_setup() .. [[
         local role = require('app.roles.storage')
         local fiber = require('fiber')
-        space:replace({'retained', 1, 200, 'fresh', {type = 'text'}, 9007199254740991, 0})
+        space:replace({'retained', 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, 0})
         box.slab.info = function()
             local memory = box.info.memory()
             return {arena_used = memory.data + memory.index, items_used = 0}
@@ -541,7 +541,7 @@ end
 g.test_eviction_error_background_retry = function(cg)
     eval(cg, [[
         local space = box.space.forecast_cache
-        space:replace({'retry-evict', 1, 200, 'fresh', {type = 'text'}, 9007199254740991, 0})
+        space:replace({'retry-evict', 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, 0})
         box.slab.info = function()
             local memory = box.info.memory()
             return {arena_used = memory.data + memory.index, items_used = 0}
@@ -564,7 +564,7 @@ g.test_eviction_cursor_handles_equal_access_times = function(cg)
     local result = eval(cg, [[
         local space = box.space.forecast_cache
         for i = 1, 101 do
-            space:replace({string.format('%03d', i), 1, 200, 'fresh', {type = 'text'}, 9007199254740991, 7})
+            space:replace({string.format('%03d', i), 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, 7})
         end
         local lib = box.lib.load('forecast')
         local evict = lib:load('evict_cache')
@@ -579,10 +579,10 @@ g.test_expiration_sweep_relieves_pressure_before_evicting_fresh_entries = functi
     local result = eval(cg, [[
         local space = box.space.forecast_cache
         for i = 1, 250 do
-            space:replace({'expired-' .. i, 1, 200, 'expired', {type = 'text'}, 0, 1000 + i})
+            space:replace({'expired-' .. i, 1, 200, binary('expired'), {type = 'text'}, 0, 1000 + i})
         end
         for i = 1, 10 do
-            space:replace({'fresh-' .. i, 1, 200, 'fresh', {type = 'text'}, 9007199254740991, i})
+            space:replace({'fresh-' .. i, 1, 200, binary('fresh'), {type = 'text'}, 9007199254740991, i})
         end
         local function expired() return space.index.expires_at:count({0}) end
         box.info.memory = function()
@@ -606,9 +606,9 @@ end
 g.test_unavailable_expired_entries_do_not_prevent_eviction = function(cg)
     local result = eval(cg, sharded_setup() .. [[
         for i = 1, 100 do
-            space:replace({'expired-' .. i, 1, 200, 'expired', {type = 'text'}, 0, i + 100})
+            space:replace({'expired-' .. i, 1, 200, binary('expired'), {type = 'text'}, 0, i + 100})
         end
-        space:replace({'fresh', 2, 200, 'fresh', {type = 'text'}, 9007199254740991, 0})
+        space:replace({'fresh', 2, 200, binary('fresh'), {type = 'text'}, 9007199254740991, 0})
         storage.bucket_refrw = function(id)
             if id == 1 then return nil, 'moving' end
             state.held = state.held + 1
@@ -637,7 +637,7 @@ g.test_eviction_phase_does_not_restart_expiration_between_batches = function(cg)
     local result = eval(cg, [[
         local space = box.space.forecast_cache
         for i = 1, 350 do
-            space:replace({string.format('fresh-%03d', i), 1, 200, 'fresh',
+            space:replace({string.format('fresh-%03d', i), 1, 200, binary('fresh'),
                 {type = 'text'}, 9007199254740991, i})
         end
         local inserted = false
@@ -645,7 +645,7 @@ g.test_eviction_phase_does_not_restart_expiration_between_batches = function(cg)
             if old ~= nil and new == nil and not inserted then
                 inserted = true
                 -- Simulate an entry expiring after the initial expiration sweep.
-                space:replace({'expired-during-eviction', 1, 200, 'expired', {type = 'text'}, 0, 10000})
+                space:replace({'expired-during-eviction', 1, 200, binary('expired'), {type = 'text'}, 0, 10000})
             end
         end
         space:before_replace(cleanup_test_state.trigger)

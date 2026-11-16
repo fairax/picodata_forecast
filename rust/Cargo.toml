@@ -7,9 +7,13 @@ edition = "2024"
 fastrand = "2"
 form_urlencoded = "1"
 httpdate = "1"
-reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "rustls"] }
+fibreq = "=0.2.0"
+# Isolate TLS from the different OpenSSL version embedded in Tarantool.
+native-tls = { version = "0.2", features = ["vendored"] }
+url = "2.5"
 serde = { version = "1", features = ["derive"] }
-tarantool = "7.0"
+serde_bytes = "0.11"
+tarantool = "6.1"
 
 [lib]
 crate-type = ["cdylib"]

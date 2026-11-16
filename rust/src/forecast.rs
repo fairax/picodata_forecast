@@ -1,10 +1,10 @@
-use std::error::Error as _;
-use std::io::{ErrorKind, Read};
+use std::io::ErrorKind;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 use std::{collections::BTreeMap, ops::Deref};
 
 use serde::{Deserialize, Serialize};
+use serde_bytes::ByteBuf;
 use tarantool::tuple::Tuple;
 
 use crate::{Result, storage::CacheEntry};
@@ -14,22 +14,11 @@ pub enum FetchError {
     Timeout(String),
     Transport(String),
     Internal(String),
-    TooLarge(String),
 }
 
 impl FetchError {
     pub fn internal(error: impl std::fmt::Display) -> Self {
         Self::Internal(error.to_string())
-    }
-
-    fn http(error: reqwest::Error) -> Self {
-        if error.is_timeout() {
-            Self::Timeout(error.to_string())
-        } else if error.is_builder() {
-            Self::Internal(error.to_string())
-        } else {
-            Self::Transport(error.to_string())
-        }
     }
 }
 
@@ -38,14 +27,13 @@ impl From<FetchError> for Response {
         let (status, body, detail) = match error {
             FetchError::Timeout(detail) => (504, "Forecast request timed out", detail),
             FetchError::Transport(detail) => (502, "Forecast service unavailable", detail),
-            FetchError::TooLarge(detail) => (502, "Forecast response too large", detail),
             FetchError::Internal(detail) => (500, "Internal server error", detail),
         };
-        // Called only on the Tarantool thread, after the HTTP worker returns.
+        // Fetching and error reporting both run on the Tarantool thread.
         tarantool::say_error!("Forecast request failed: {}", detail);
         Response {
             status,
-            body: body.to_owned(),
+            body: ByteBuf::from(body),
             headers: BTreeMap::from([("content-type".into(), "text/plain; charset=utf-8".into())]),
         }
     }
@@ -54,7 +42,7 @@ impl From<FetchError> for Response {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Response {
     pub status: u16,
-    pub body: String,
+    pub body: ByteBuf,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -106,9 +94,8 @@ impl Deref for NormalizedQuery {
 }
 
 struct ForecastConfig {
-    endpoint: reqwest::Url,
+    endpoint: url::Url,
     timeout: Duration,
-    max_response_bytes: usize,
 }
 
 static CONFIG: OnceLock<ForecastConfig> = OnceLock::new();
@@ -122,7 +109,7 @@ pub fn initialize() -> std::result::Result<(), FetchError> {
         Err(std::env::VarError::NotPresent) => "https://api.open-meteo.com/v1/forecast".to_owned(),
         Err(error) => return Err(FetchError::internal(error)),
     };
-    let endpoint = reqwest::Url::parse(&endpoint).map_err(FetchError::internal)?;
+    let endpoint = url::Url::parse(&endpoint).map_err(FetchError::internal)?;
     if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host_str().is_none() {
         return Err(FetchError::internal(
             "OPEN_METEO_FORECAST_URL must be an HTTP or HTTPS URL with a host",
@@ -132,48 +119,16 @@ pub fn initialize() -> std::result::Result<(), FetchError> {
     Instant::now().checked_add(timeout).ok_or_else(|| {
         FetchError::internal("OPEN_METEO_TIMEOUT_SECS exceeds the supported deadline range")
     })?;
-    let max_response_bytes = match std::env::var("OPEN_METEO_MAX_RESPONSE_BYTES") {
-        Ok(value) => value
-            .parse::<usize>()
-            .ok()
-            .filter(|&size| size > 0 && size < usize::MAX)
-            .ok_or_else(|| {
-                FetchError::internal(
-                    "OPEN_METEO_MAX_RESPONSE_BYTES must be a positive integer below usize::MAX",
-                )
-            })?,
-        Err(std::env::VarError::NotPresent) => 1_048_576,
-        Err(error) => {
-            return Err(FetchError::internal(format!(
-                "OPEN_METEO_MAX_RESPONSE_BYTES: {error}"
-            )));
-        }
-    };
     CONFIG
-        .set(ForecastConfig {
-            endpoint,
-            timeout,
-            max_response_bytes,
-        })
+        .set(ForecastConfig { endpoint, timeout })
         .map_err(|_| FetchError::internal("Forecast configuration is already initialized"))
 }
 
-/// Fetch a forecast using configuration saved by [initialize].
-///
-/// Run only in the `coio_call` worker: HTTP and backoff block the calling thread.
-/// Retry transient transport failures and HTTP 429/502/503/504 up to three attempts,
-/// reusing one client with built-in retries disabled to avoid multiplying attempts.
-/// Attempts are capped at 10 seconds and share `OPEN_METEO_TIMEOUT_SECS` (default 30)
-/// with retry delays; worker queue time is excluded. A monotonic deadline prevents
-/// clock changes from extending the budget.
-///
-/// Jittered backoff (0–200 ms, then 0–400 ms) spreads retry load. Honor `Retry-After`
-/// seconds or dates; return the last result if the delay would exhaust the budget.
-/// Permanent failures are not retried. Redirects follow Reqwest's default policy.
-///
-/// HTTP errors remain `Ok(Response)` for forwarding; transport/internal failures
-/// return [FetchError]. The caller logs/maps errors and caches only 2xx responses.
-/// This function performs no cache access, request coalescing, or Tarantool calls.
+/// Fetch on the calling Tarantool fiber, yielding during network I/O and backoff.
+/// Retry temporary failures up to three times, with jitter and Retry-After.
+/// The deadline gates attempts; fibreq uses separate phase timeouts,
+/// so one exchange can outlive the remaining overall budget. Responses are fully
+/// buffered without a size limit because fibreq 0.2 has no bounded body-reading API.
 pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchError> {
     let config = CONFIG
         .get()
@@ -186,10 +141,6 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
     let deadline = Instant::now().checked_add(config.timeout).ok_or_else(|| {
         FetchError::internal("OPEN_METEO_TIMEOUT_SECS exceeds the supported deadline range")
     })?;
-    let client = reqwest::blocking::Client::builder()
-        .retry(reqwest::retry::never())
-        .build()
-        .map_err(FetchError::internal)?;
 
     for attempt in 0..3 {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -198,8 +149,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
                 "Forecast retry deadline exceeded".into(),
             ));
         }
-        let timeout = remaining.min(Duration::from_secs(10));
-        let outcome = fetch_once(&client, url.clone(), timeout, config.max_response_bytes);
+        let outcome = fetch_once(url.clone(), deadline);
         let delay = Duration::from_millis(fastrand::u64(0..=200 * (1 << attempt)));
         let (failure, delay) = match outcome {
             Ok(response) => {
@@ -214,7 +164,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
                 (Ok(response), delay.max(retry_after))
             }
             Err(error) => {
-                let failure = error.classify(config.max_response_bytes);
+                let failure = error.classify();
                 if attempt == 2 || !failure.retryable {
                     return Err(failure.error);
                 }
@@ -226,7 +176,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
             return failure;
         }
         drop(failure); // Release body buffers and failed attempt resources before waiting.
-        std::thread::sleep(delay); // fetch() runs only in the HTTP worker.
+        tarantool::fiber::sleep(delay);
     }
     unreachable!("Every final attempt returns its response or error")
 }
@@ -264,16 +214,15 @@ fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
         .map(|date| date.duration_since(now).unwrap_or_default())
 }
 
-fn retryable_transport(error: &reqwest::Error) -> bool {
-    if error.is_timeout() {
-        return true;
-    }
-    let mut source = error.source();
-    while let Some(cause) = source {
+fn temporary_cause(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(cause) = current {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            return retryable_io(io);
+            if retryable_io(io) {
+                return true;
+            }
         }
-        source = cause.source();
+        current = cause.source();
     }
     false
 }
@@ -294,9 +243,9 @@ fn retryable_io(error: &std::io::Error) -> bool {
 }
 
 enum AttemptError {
-    Http(reqwest::Error),
-    Read(std::io::Error),
-    TooLarge,
+    Http(Box<fibreq::Error>),
+    IncompleteBody { expected: u64, received: usize },
+    Deadline,
 }
 
 struct ClassifiedFailure {
@@ -305,20 +254,23 @@ struct ClassifiedFailure {
 }
 
 impl AttemptError {
-    fn classify(self, max_bytes: usize) -> ClassifiedFailure {
+    fn classify(self) -> ClassifiedFailure {
         match self {
-            Self::Http(error) => ClassifiedFailure {
-                retryable: retryable_transport(&error),
-                error: FetchError::http(error),
-            },
-            Self::Read(error) => {
-                let http_error = error
-                    .get_ref()
-                    .and_then(|cause| cause.downcast_ref::<reqwest::Error>());
-                let timeout = error.kind() == ErrorKind::TimedOut
-                    || http_error.is_some_and(reqwest::Error::is_timeout);
-                let retryable =
-                    timeout || retryable_io(&error) || http_error.is_some_and(retryable_transport);
+            Self::Http(error) => {
+                use fibreq::Error;
+                let timeout = matches!(
+                    *error,
+                    Error::Timeout | Error::TCP(tarantool::network::client::tcp::Error::Timeout)
+                );
+                let temporary = match error.as_ref() {
+                    Error::HTTP(cause) => temporary_cause(cause.as_ref()),
+                    Error::IO(cause) => retryable_io(cause),
+                    Error::TCP(tarantool::network::client::tcp::Error::Connect {
+                        error, ..
+                    }) => retryable_io(error),
+                    _ => temporary_cause(error.as_ref()),
+                };
+                let retryable = timeout || matches!(*error, Error::SocketClosed) || temporary;
                 let detail = error.to_string();
                 ClassifiedFailure {
                     error: if timeout {
@@ -326,52 +278,72 @@ impl AttemptError {
                     } else {
                         FetchError::Transport(detail)
                     },
-                    retryable,
+                    retryable: retryable && !matches!(*error, Error::TLS(_)),
                 }
             }
-            Self::TooLarge => ClassifiedFailure {
-                error: FetchError::TooLarge(format!("Upstream response exceeds {max_bytes} bytes")),
+            Self::IncompleteBody { expected, received } => ClassifiedFailure {
+                error: FetchError::Transport(format!(
+                    "Incomplete upstream body: expected {expected} bytes, received {received}"
+                )),
+                retryable: true,
+            },
+            Self::Deadline => ClassifiedFailure {
+                error: FetchError::Timeout("Forecast retry deadline exceeded".into()),
                 retryable: false,
             },
         }
     }
 }
 
-fn fetch_once(
-    client: &reqwest::blocking::Client,
-    url: reqwest::Url,
-    timeout: Duration,
-    max_bytes: usize,
-) -> std::result::Result<Response, AttemptError> {
-    let response = client
-        .get(url)
-        .timeout(timeout)
+fn fetch_once(url: url::Url, deadline: Instant) -> std::result::Result<Response, AttemptError> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(AttemptError::Deadline);
+    }
+    let timeout = remaining.min(Duration::from_secs(10));
+    // A private client per exchange avoids reusing a socket before its body
+    // is consumed, and avoids repeated TLS handshakes on a pooled TLS socket.
+    let client = fibreq::ClientBuilder::new()
+        .pool_max_conns(1)
+        .pool_connect_timeout(timeout)
+        .pool_acquire_timeout(timeout)
+        .build();
+    let mut response = client
+        .get(url.as_str())
+        .map_err(AttemptError::Http)?
+        .tls_timeout(timeout)
+        .request_timeout(timeout)
+        .response_timeout(timeout)
         .send()
         .map_err(AttemptError::Http)?;
-    let status = response.status().as_u16();
+    let status = response.status() as u16;
     let headers = response
         .headers()
-        .iter()
-        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
+        .into_iter()
+        // fibreq's HTTP decoder synthesizes a Date value containing CRLF.
+        // Never forward values that could inject HTTP header boundaries.
+        .filter(|(_, values)| !values.last().as_str().contains(['\r', '\n']))
+        .map(|(name, values)| (name.as_str().to_owned(), values.last().as_str().to_owned()))
         .collect::<BTreeMap<_, _>>();
-    // Probe one extra byte: headers can omit or misrepresent the body length.
-    let mut bytes = Vec::new();
-    response
-        .take((max_bytes + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(AttemptError::Read)?;
-    if bytes.len() > max_bytes {
-        return Err(AttemptError::TooLarge);
-    }
-    // Match Reqwest text() with charset disabled; replacement characters can
-    // expand the UTF-8 output, which must also fit the configured limit.
-    let text = String::from_utf8_lossy(&bytes);
-    if text.len() > max_bytes {
-        return Err(AttemptError::TooLarge);
-    }
+    let bytes = if (100..200).contains(&status) || matches!(status, 204 | 304) {
+        // Content-Length on 304 describes the representation, not a response body.
+        Vec::new()
+    } else {
+        let expected = response.content_length();
+        let bytes = response.bytes().map_err(AttemptError::Http)?;
+        if let Some(expected) = expected {
+            if bytes.len() as u64 != expected {
+                return Err(AttemptError::IncompleteBody {
+                    expected,
+                    received: bytes.len(),
+                });
+            }
+        }
+        bytes
+    };
     Ok(Response {
         status,
-        body: text.into_owned(),
+        body: ByteBuf::from(bytes),
         headers,
     })
 }
