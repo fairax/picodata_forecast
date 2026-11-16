@@ -154,7 +154,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
         }
         let outcome = fetch_once(url.clone(), deadline);
         let delay = Duration::from_millis(fastrand::u64(0..=200 * (1 << attempt)));
-        let (failure, delay) = match outcome {
+        let (last_outcome, delay) = match outcome {
             Ok(response) => {
                 if attempt == 2 || !matches!(response.status, 429 | 502 | 503 | 504) {
                     return Ok(response);
@@ -177,10 +177,13 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
         };
         // Preserve the last response/error if there is no time for another attempt.
         if delay >= deadline.saturating_duration_since(Instant::now()) {
-            return failure;
+            return last_outcome;
         }
-        drop(failure); // Release body buffers and failed attempt resources before waiting.
         tarantool::fiber::sleep(delay);
+        // A busy scheduler can resume this fiber after the retry budget expires.
+        if Instant::now() >= deadline {
+            return last_outcome;
+        }
     }
     unreachable!("Every final attempt returns its response or error")
 }

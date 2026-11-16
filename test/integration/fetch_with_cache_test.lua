@@ -664,6 +664,38 @@ local function set_timeout(cg, value)
     configure(cg, cg.endpoint, value)
 end
 
+g.test_backoff_deadline_preserves_last_response = function(cg)
+    configure(cg, cg.endpoint, '2')
+    cg.auto_respond, cg.status, cg.body, cg.retry_after = true, 503, 'upstream detail', '1'
+    local router = cg.cluster.servers[2]
+    local pending = fetch(cg, 'retry=late-wakeup', true)
+    t.assert_equals(cg.entered:get(5), true)
+    fiber.sleep(0.1) -- Let the response arrive and the retry backoff begin.
+    router.net_box:eval([[
+        local fiber = require('fiber')
+        fiber.set_max_slice({warn = 5, err = 5})
+        local clock = require('clock')
+        local deadline = clock.monotonic() + 2.2
+        -- Simulate a busy scheduler resuming the fetch after its deadline.
+        while clock.monotonic() < deadline do end
+    ]], {}, {timeout = 5})
+    local response = finish(pending).response
+    t.assert_equals(response.status, 503)
+    t.assert_equals(response.body, 'upstream detail')
+    t.assert_equals(response.headers['retry-after'], {'1'})
+    t.assert_equals(cg.requests, 1)
+end
+
+g.test_valid_delay_does_not_require_a_second_backoff_budget = function(cg)
+    configure(cg, cg.endpoint, '3')
+    cg.auto_respond = true
+    cg.actions = {{status = 503, retry_after = '2'}, {status = 200, body = 'recovered'}}
+    local response = fetch(cg, 'retry=valid-delay').response
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'recovered')
+    t.assert_equals(cg.requests, 2)
+end
+
 g.test_configured_timeout_bounds_a_slow_stage = function(cg)
     set_timeout(cg, '1')
     local started = fiber.clock()
