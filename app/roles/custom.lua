@@ -39,7 +39,7 @@ local function fetch(query)
     if response ~= nil and response ~= box.NULL then return response end
 
     if active_fetches >= max_concurrent_fetches then
-        return {status = 503, body = 'Forecast service busy', headers = {['content-type'] = 'text/plain'}}
+        return {status = 503, body = 'Forecast service busy', headers = {['content-type'] = {'text/plain'}}}
     end
     local completion = fiber.channel(1)
     -- No yield between checking the limit and reserving a permit.
@@ -68,6 +68,16 @@ end
 
 local function filter_headers(headers)
     headers = headers or {}
+    local safe_headers = {}
+    for name, values in pairs(headers) do
+        local safe = {}
+        for _, value in ipairs(values) do
+            if not value:find('[\r\n]') then safe[#safe + 1] = value end
+        end
+        if #safe > 0 then
+            safe_headers[name] = safe
+        end
+    end
     local excluded = {
         connection = true,
         ['keep-alive'] = true,
@@ -79,15 +89,17 @@ local function filter_headers(headers)
         -- The HTTP server supplies framing for the returned body.
         ['content-length'] = true,
     }
-    for name, value in pairs(headers) do
+    for name, values in pairs(safe_headers) do
         if name:lower() == 'connection' then
-            for token in value:gmatch('[^,]+') do
-                excluded[token:match('^%s*(.-)%s*$'):lower()] = true
+            for _, value in ipairs(values) do
+                for token in value:gmatch('[^,]+') do
+                    excluded[token:match('^%s*(.-)%s*$'):lower()] = true
+                end
             end
         end
     end
     local filtered = {}
-    for name, value in pairs(headers) do
+    for name, value in pairs(safe_headers) do
         if not excluded[name:lower()] then filtered[name] = value end
     end
     return filtered

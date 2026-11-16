@@ -18,7 +18,7 @@ local function seed_expired(cg, key)
     cg.cluster.main_server.net_box:eval([[
         local key = ...
         local binary = require('test.fixtures.binary')
-        box.space.forecast_cache:replace({key, 1, 200, binary('old'), {['content-type'] = 'application/json'}, 0, 0})
+        box.space.forecast_cache:replace({key, 1, 200, binary('old'), {['content-type'] = {'application/json'}}, 0, 0})
     ]], {key})
 end
 
@@ -90,7 +90,7 @@ end
 
 local function put(cg, query, body)
     return call(cg, 'cache_put', query, 1, {
-        status = 200, body = body or 'new', headers = {['content-type'] = 'application/json'},
+        status = 200, body = body or 'new', headers = {['content-type'] = {'application/json'}},
     })
 end
 
@@ -99,13 +99,24 @@ g.test_put_and_get = function(cg)
     local response = call(cg, 'cache_get', 'forecast=1')
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, 'new')
-    t.assert_equals(response.headers['x-cache'], 'HIT')
+    t.assert_equals(response.headers['x-cache'], {'HIT'})
     local timing = cg.cluster.main_server.net_box:eval([[
         local tuple = box.space.forecast_cache:get('forecast=1')
         return {ttl = tuple[6] - tuple[7], bucket = tuple[2]}
     ]])
     t.assert(timing.ttl > 59000000 and timing.ttl <= 60000000)
     t.assert_equals(timing.bucket, 1)
+end
+
+g.test_repeated_headers_round_trip = function(cg)
+    local headers = {['content-type'] = {'text/plain'},
+        ['set-cookie'] = {'first=1; Expires=Wed, 21 Oct 2037 07:28:00 GMT', 'second=2'},
+        ['cache-control'] = {'no-store', 'max-age=60'}}
+    t.assert_equals(call(cg, 'cache_put', 'headers=multiple', 1,
+        {status = 200, body = 'body', headers = headers}), true)
+    local response = call(cg, 'cache_get', 'headers=multiple')
+    headers['x-cache'] = {'HIT'}
+    t.assert_equals(response.headers, headers)
 end
 
 g.test_missing_key_returns_miss = function(cg)
@@ -123,7 +134,7 @@ g.test_binary_body_round_trip = function(cg)
             t.assert_equals(put(cg, key, input), true)
             local response = call(cg, 'cache_get', key)
             t.assert_equals(response.body, body)
-            t.assert_equals(response.headers['x-cache'], 'HIT')
+            t.assert_equals(response.headers['x-cache'], {'HIT'})
             local marker = cg.cluster.main_server.net_box:eval([[
                 local msgpack = require('msgpack')
                 local encoded = msgpack.encode(box.space.forecast_cache:get(...))
@@ -157,7 +168,7 @@ g.test_expired_read_deletes_entry = function(cg)
 end
 
 g.test_non_successful_responses_are_not_cached = function(cg)
-    call(cg, 'cache_put', 'error=1', 1, {status = 503, body = 'error', headers = {type = 'text'}})
+    call(cg, 'cache_put', 'error=1', 1, {status = 503, body = 'error', headers = {type = {'text'}}})
     t.assert_equals(call(cg, 'cache_get', 'error=1'), nil)
 end
 
@@ -194,7 +205,7 @@ end
 g.test_schema_initialization_preserves_existing_cache = function(cg)
     put(cg, 'preserve=1')
     call(cg, 'create_schema')
-    t.assert_equals(call(cg, 'cache_get', 'preserve=1').headers['x-cache'], 'HIT')
+    t.assert_equals(call(cg, 'cache_get', 'preserve=1').headers['x-cache'], {'HIT'})
 end
 
 g.test_insertion_errors_are_reported_and_recover = function(cg)
@@ -212,7 +223,7 @@ g.test_insertion_errors_are_reported_and_recover = function(cg)
         ]])
     end
     put(cg, 'recovered=1')
-    t.assert_equals(call(cg, 'cache_get', 'recovered=1').headers['x-cache'], 'HIT')
+    t.assert_equals(call(cg, 'cache_get', 'recovered=1').headers['x-cache'], {'HIT'})
 end
 
 g.test_access_time_failure_serves_cached_response = function(cg)
@@ -224,14 +235,14 @@ g.test_access_time_failure_serves_cached_response = function(cg)
     local response = call(cg, 'cache_get', 'touch=1')
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, 'new')
-    t.assert_equals(response.headers['x-cache'], 'HIT')
+    t.assert_equals(response.headers['x-cache'], {'HIT'})
 end
 
 g.test_failed_expired_deletion_returns_miss = function(cg)
     cg.cluster.main_server.net_box:eval([[
         require('app.roles.storage').stop()
         local binary = require('test.fixtures.binary')
-        box.space.forecast_cache:replace({'expired-failure=1', 1, 200, binary('stale'), {type = 'text'}, 0, 0})
+        box.space.forecast_cache:replace({'expired-failure=1', 1, 200, binary('stale'), {type = {'text'}}, 0, 0})
         rawset(_G, 'cache_failure_trigger', function() error('injected cache write failure') end)
         box.space.forecast_cache:before_replace(cache_failure_trigger)
     ]])
@@ -253,7 +264,7 @@ g.test_cache_hit_updates_access_time = function(cg)
     cg.cluster.main_server.net_box:eval([[
         box.space.forecast_cache:update('touch=1', {{'=', 7, 1}})
     ]])
-    t.assert_equals(call(cg, 'cache_get', 'touch=1').headers['x-cache'], 'HIT')
+    t.assert_equals(call(cg, 'cache_get', 'touch=1').headers['x-cache'], {'HIT'})
     t.assert(cg.cluster.main_server.net_box:eval([[
         return box.space.forecast_cache:get('touch=1')[7]
     ]]) > 1)

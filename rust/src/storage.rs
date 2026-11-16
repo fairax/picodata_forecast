@@ -111,7 +111,7 @@ pub fn get_cache_entry(key: &str) -> Result<Option<Response>> {
     if let Err(error) = touch {
         tarantool::say_error!("Cache access time update failed: {}", error);
     }
-    result.headers.insert("x-cache".into(), "HIT".into());
+    result.headers.insert("x-cache".into(), vec!["HIT".into()]);
     Ok(Some(result))
 }
 
@@ -151,7 +151,7 @@ impl CacheEntry<'_> {
         self.field(3, "body")
     }
 
-    pub fn headers(&self) -> Result<BTreeMap<String, String>> {
+    pub fn headers(&self) -> Result<BTreeMap<String, Vec<String>>> {
         self.field(4, "headers")
     }
 

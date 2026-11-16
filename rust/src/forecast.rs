@@ -34,7 +34,10 @@ impl From<FetchError> for Response {
         Response {
             status,
             body: ByteBuf::from(body),
-            headers: BTreeMap::from([("content-type".into(), "text/plain; charset=utf-8".into())]),
+            headers: BTreeMap::from([(
+                "content-type".into(),
+                vec!["text/plain; charset=utf-8".into()],
+            )]),
         }
     }
 }
@@ -43,7 +46,7 @@ impl From<FetchError> for Response {
 pub struct Response {
     pub status: u16,
     pub body: ByteBuf,
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, Vec<String>>,
 }
 
 impl TryFrom<&Tuple> for Response {
@@ -159,6 +162,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
                 let retry_after = response
                     .headers
                     .get("retry-after")
+                    .and_then(|values| values.last())
                     .and_then(|value| retry_after(value, SystemTime::now()))
                     .unwrap_or_default();
                 (Ok(response), delay.max(retry_after))
@@ -322,8 +326,15 @@ fn fetch_once(url: url::Url, deadline: Instant) -> std::result::Result<Response,
         .into_iter()
         // fibreq's HTTP decoder synthesizes a Date value containing CRLF.
         // Never forward values that could inject HTTP header boundaries.
-        .filter(|(_, values)| !values.last().as_str().contains(['\r', '\n']))
-        .map(|(name, values)| (name.as_str().to_owned(), values.last().as_str().to_owned()))
+        .filter_map(|(name, values)| {
+            let values: Vec<_> = values
+                .iter()
+                .map(|value| value.as_str())
+                .filter(|value| !value.contains(['\r', '\n']))
+                .map(str::to_owned)
+                .collect();
+            (!values.is_empty()).then(|| (name.as_str().to_owned(), values))
+        })
         .collect::<BTreeMap<_, _>>();
     let bytes = if (100..200).contains(&status) || matches!(status, 204 | 304) {
         // Content-Length on 304 describes the representation, not a response body.

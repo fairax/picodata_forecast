@@ -210,7 +210,7 @@ g.test_fetch_yields_and_populates_cache = function(cg)
     local cached = fetch(cg, 'a=1&b=2')
     t.assert_equals(cached.ok, true)
     t.assert_equals(cached.response.body, response.response.body)
-    t.assert_equals(cached.response.headers['x-cache'], 'HIT')
+    t.assert_equals(cached.response.headers['x-cache'], {'HIT'})
     t.assert_equals(cg.requests, 1)
 end
 
@@ -363,7 +363,7 @@ g.test_cache_decode_failure_fetches_upstream = function(cg)
         server.net_box:eval([[
             local space = box.space.forecast_cache
             if space:get('corrupt=1') then
-                -- The schema permits a map, but Response requires string values.
+                -- The schema permits a map, but Response requires lists of strings.
                 space:update('corrupt=1', {{'=', 5, {['private-header'] = 123}}})
             end
         ]])
@@ -471,7 +471,7 @@ g.test_cleanup_runs_safely_during_bucket_transfer = function(cg)
         local query, bucket, destination = ...
         local space = box.space.forecast_cache
         local binary = require('test.fixtures.binary')
-        local headers = {['content-type'] = 'application/octet-stream'}
+        local headers = {['content-type'] = {'application/octet-stream'}}
         space:replace({query, bucket, 200, binary('fresh' .. string.char(0, 255, 128)),
             headers, 9007199254740991, 0})
         space:replace({'expired-migration', bucket, 200, binary('old'), headers, 0, 0})
@@ -502,7 +502,7 @@ g.test_transient_responses_retry_then_cache_success = function(cg)
     t.assert_equals(cg.requests, 3)
     local cached = fetch(cg, 'retry=success')
     t.assert_equals(cached.response.body, 'final')
-    t.assert_equals(cached.response.headers['x-cache'], 'HIT')
+    t.assert_equals(cached.response.headers['x-cache'], {'HIT'})
     t.assert_equals(cg.requests, 3)
 end
 
@@ -515,7 +515,7 @@ g.test_persistent_transient_statuses_stop_after_three_attempts = function(cg)
         local response = fetch(cg, 'persistent=' .. status)
         t.assert_equals(response.response.status, status)
         t.assert_equals(response.response.body, cg.body)
-        t.assert_equals(response.response.headers['retry-after'], '0')
+        t.assert_equals(response.response.headers['retry-after'], {'0'})
         t.assert_equals(cg.requests - before, 3)
     end
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
@@ -624,7 +624,7 @@ g.test_not_modified_content_length_is_metadata = function(cg)
     local response = fetch(cg, 'bodyless=304').response
     t.assert_equals(response.status, 304)
     t.assert_equals(response.body, '')
-    t.assert_equals(response.headers['content-length'], '20')
+    t.assert_equals(response.headers['content-length'], {'20'})
     t.assert_equals(fault_state(cg).count, 1)
 end
 
@@ -655,7 +655,7 @@ g.test_retry_after_beyond_budget_returns_upstream_response = function(cg)
         local before = cg.requests
         local response = fetch(cg, 'retry=overbudget-' .. before)
         t.assert_equals(response.response.status, 503)
-        t.assert_equals(response.response.headers['retry-after'], delay)
+        t.assert_equals(response.response.headers['retry-after'], {delay})
         t.assert_equals(cg.requests - before, 1)
     end
 end
@@ -936,7 +936,7 @@ g.test_bucket_can_move_while_upstream_fetch_is_pending = function(cg)
         return tuple and {bucket = tuple[2], body = tuple[4]}
     ]], {query})
     t.assert_equals(stored, {bucket = bucket, body = query})
-    t.assert_equals(fetch(cg, query).response.headers['x-cache'], 'HIT')
+    t.assert_equals(fetch(cg, query).response.headers['x-cache'], {'HIT'})
     t.assert_equals(cg.requests, 1)
 end
 
@@ -947,13 +947,13 @@ g.test_expired_response_is_refetched_by_router = function(cg)
     source.net_box:eval([[
         local query, bucket = ...
         local binary = require('test.fixtures.binary')
-        box.space.forecast_cache:replace({query, bucket, 200, binary('stale'), {type = 'text'}, 0, 0})
+        box.space.forecast_cache:replace({query, bucket, 200, binary('stale'), {type = {'text'}}, 0, 0})
     ]], {query, bucket})
     local response = fetch(cg, query).response
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, query)
     t.assert_equals(response.headers['x-cache'], nil)
-    t.assert_equals(fetch(cg, query).response.headers['x-cache'], 'HIT')
+    t.assert_equals(fetch(cg, query).response.headers['x-cache'], {'HIT'})
     t.assert_equals(cg.requests, 1)
 end
 
@@ -985,7 +985,7 @@ g.test_fetch_limit_rejects_misses_but_serves_hits = function(cg)
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?limit=third', {raise = false})
     t.assert_equals(response.status, 503)
     t.assert_equals(response.body, 'Forecast service busy')
-    t.assert_equals(fetch(cg, 'limit=cached').response.headers['x-cache'], 'HIT')
+    t.assert_equals(fetch(cg, 'limit=cached').response.headers['x-cache'], {'HIT'})
     t.assert_equals(cg.requests, before)
     cg.gate:put(true)
     t.assert_equals(finish(first).response.status, 200)
@@ -1057,6 +1057,39 @@ g.test_fetch_limit_holds_permit_across_retries = function(cg)
     t.assert_equals(fetch(cg, 'limit=after-retry').response.status, 200)
 end
 
+g.test_repeated_retry_after_preserves_last_value_policy = function(cg)
+    cg.header_listener = assert(require('socket').tcp_server('127.0.0.1', 0, function(connection)
+        if not connection:read({delimiter = '\r\n\r\n'}, 5) then return end
+        cg.requests = cg.requests + 1
+        connection:write('HTTP/1.1 503 Service Unavailable\r\nContent-Length: 5\r\n' ..
+            'Retry-After: 120\r\nRetry-After: 0\r\nConnection: close\r\n\r\nerror', 5)
+    end))
+    configure(cg, 'http://127.0.0.1:' .. cg.header_listener:name().port .. '/forecast')
+    local response = fetch(cg, 'headers=retry-after').response
+    t.assert_equals(response.status, 503)
+    t.assert_equals(response.body, 'error')
+    t.assert_equals(response.headers['retry-after'], {'120', '0'})
+    t.assert_equals(cg.requests, 3)
+end
+
+local function raw_http_response(router, path)
+    local socket = require('socket')
+    local conn = assert(socket.tcp_connect('127.0.0.1', router.http_port, 5))
+    assert(conn:write('GET ' .. path .. ' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n', 5))
+    local raw = assert(conn:read({delimiter = '\r\n\r\n'}, 5))
+    local headers = {}
+    for name, value in raw:gmatch('([^\r\n:]+): ([^\r\n]*)\r\n') do
+        name = name:lower()
+        local previous = headers[name]
+        if previous == nil then headers[name] = value
+        elseif type(previous) == 'table' then previous[#previous + 1] = value
+        else headers[name] = {previous, value} end
+    end
+    local body = assert(conn:read(tonumber(headers['content-length']), 5))
+    conn:close()
+    return {status = tonumber(raw:match('^HTTP/1%.1 (%d+)')), headers = headers, body = body}
+end
+
 g.test_connection_headers_removed_from_upstream_and_cache_hits = function(cg)
     -- Use a raw server: http.server replaces Connection with its own value.
     cg.header_listener = assert(require('socket').tcp_server('127.0.0.1', 0, function(connection)
@@ -1068,7 +1101,8 @@ g.test_connection_headers_removed_from_upstream_and_cache_hits = function(cg)
             'Content-Length: ' .. #body,
             'Content-Type: text/plain',
             'Retry-After: 0',
-            'Connection: close, X-Private-Hop,  x-SECOND-Hop  ',
+            'Connection: X-Private-Hop',
+            'Connection: close,  x-SECOND-Hop  ',
             'Keep-Alive: timeout=5',
             'Proxy-Connection: keep-alive',
             'TE: trailers',
@@ -1077,13 +1111,17 @@ g.test_connection_headers_removed_from_upstream_and_cache_hits = function(cg)
             'X-Private-Hop: private',
             'X-Second-Hop: also private',
             'X-End-To-End: preserved',
+            'Cache-Control: no-store',
+            'Cache-Control: max-age=60',
+            'Set-Cookie: first=1; Expires=Wed, 21 Oct 2037 07:28:00 GMT',
+            'Set-Cookie: second=2',
             '', body,
         }, '\r\n'))
     end))
     configure(cg, 'http://127.0.0.1:' .. cg.header_listener:name().port .. '/forecast')
     local router = cg.cluster.servers[2]
     for attempt = 1, 2 do
-        local response = router:http_request('get', '/forecast?headers=upstream')
+        local response = raw_http_response(router, '/forecast?headers=upstream')
         t.assert_equals(response.status, 200)
         t.assert_equals(response.body, 'headers=upstream')
         for _, name in ipairs({'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade',
@@ -1093,6 +1131,9 @@ g.test_connection_headers_removed_from_upstream_and_cache_hits = function(cg)
         t.assert_equals(response.headers['content-type'], 'text/plain')
         t.assert_equals(response.headers['retry-after'], '0')
         t.assert_equals(response.headers['x-end-to-end'], 'preserved')
+        t.assert_equals(response.headers['cache-control'], {'no-store', 'max-age=60'})
+        t.assert_equals(response.headers['set-cookie'],
+            {'first=1; Expires=Wed, 21 Oct 2037 07:28:00 GMT', 'second=2'})
         if attempt == 2 then t.assert_equals(response.headers['x-cache'], 'HIT') end
     end
     t.assert_equals(cg.requests, 1)
@@ -1105,25 +1146,32 @@ g.test_cached_headers_filtered_case_insensitively = function(cg)
         local query, bucket = ...
         box.lib.load('forecast'):load('cache_put')(query, bucket, {
             status = 200, body = 'cached', headers = {
-                CoNnEcTiOn = ' X-First, , x-SECOND  ',
-                ['X-FIRST'] = 'private', ['x-Second'] = 'private',
-                ['KeEp-AlIvE'] = 'timeout=5', ['PrOxY-CoNnEcTiOn'] = 'keep-alive',
-                Te = 'trailers', TrAiLeR = 'x-trailer', UpGrAdE = 'example',
-                ['TrAnSfEr-EnCoDiNg'] = 'chunked', ['CoNtEnT-LeNgTh'] = '999',
-                ['Content-Type'] = 'text/plain', ['Retry-After'] = '7',
+                CoNnEcTiOn = {' X-First, ', ', x-SECOND  '}, connection = {'x-third'},
+                ['X-FIRST'] = {'private'}, ['x-Second'] = {'private'},
+                ['X-Third'] = {'private'},
+                ['KeEp-AlIvE'] = {'timeout=5'}, ['PrOxY-CoNnEcTiOn'] = {'keep-alive'},
+                Te = {'trailers'}, TrAiLeR = {'x-trailer'}, UpGrAdE = {'example'},
+                ['TrAnSfEr-EnCoDiNg'] = {'chunked'}, ['CoNtEnT-LeNgTh'] = {'999'},
+                ['Content-Type'] = {'text/plain'}, ['Retry-After'] = {'7'},
+                ['X-Safe-Values'] = {'first', 'bad\r\ninjection', 'second'},
+                ['X-Only-Unsafe'] = {'bad\nvalue'},
             },
         })
     ]], {query, bucket})
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?' .. query)
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, 'cached')
-    for _, name in ipairs({'x-first', 'x-second', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade'}) do
+    for _, name in ipairs({'x-first', 'x-second', 'x-third', 'keep-alive', 'proxy-connection',
+        'te', 'trailer', 'upgrade', 'x-only-unsafe'}) do
         t.assert_equals(response.headers[name], nil)
     end
     t.assert(response.headers['content-length'] ~= '999')
     t.assert_equals(response.headers['content-type'], 'text/plain')
     t.assert_equals(response.headers['retry-after'], '7')
     t.assert_equals(response.headers['x-cache'], 'HIT')
+    local raw = raw_http_response(cg.cluster.servers[2], '/forecast?' .. query)
+    t.assert_equals(raw.headers['x-safe-values'], {'first', 'second'})
+    t.assert_equals(raw.headers['x-only-unsafe'], nil)
     t.assert_equals(cg.requests, 0)
 end
 
@@ -1157,7 +1205,7 @@ g.test_router_role_disable_and_reenable = function(cg)
     cg.router_role_disabled = nil
     -- Re-enabling must retain permits held by requests that are still running.
     t.assert_equals(fetch(cg, 'lifecycle=busy').response.body, 'Forecast service busy')
-    t.assert_equals(fetch(cg, 'lifecycle=cached').response.headers['x-cache'], 'HIT')
+    t.assert_equals(fetch(cg, 'lifecycle=cached').response.headers['x-cache'], {'HIT'})
     cg.gate:put(true)
     t.assert_equals(finish(pending).response.status, 200)
     cg.auto_respond = true
@@ -1204,7 +1252,7 @@ g.test_redirect_statuses_are_not_followed_retried_or_cached = function(cg)
             local response = fetch(cg, 'redirect=' .. status).response
             t.assert_equals(response.status, status)
             t.assert_equals(response.body, 'redirect body')
-            t.assert_equals(response.headers.location, target)
+            t.assert_equals(response.headers.location, {target})
             t.assert_equals(response.headers['x-cache'], nil)
             t.assert_equals(cg.requests, before + i)
         end
