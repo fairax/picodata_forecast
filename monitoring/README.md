@@ -32,7 +32,34 @@ targets; request metrics are emitted on routers.
 docker compose -f compose.monitoring.yml config --quiet
 docker compose -f compose.monitoring.yml run --rm --no-deps \
   --entrypoint promtool prometheus check config /etc/prometheus/prometheus.yml
+python3 monitoring/test_alerts.py
 ```
+
+The alert tests use Python 3.9+ (standard library only) and Docker. They extract
+the exact provisioned queries, thresholds, and pending durations and test them
+with the pinned Prometheus image; there is no duplicate set of production rules.
+
+## Alerts
+
+Grafana-managed rules are provisioned from `grafana/provisioning/alerting/alerts.json`
+in the **Open-Meteo** folder. See [alert thresholds and response steps](ALERTS.md).
+Rules use the existing Prometheus data source; no separate Alertmanager is needed.
+After adding the provisioning mount, apply it with:
+
+```bash
+docker compose -f compose.monitoring.yml up -d grafana
+```
+
+For subsequent changes to the rules file, restart Grafana:
+
+```bash
+docker compose -f compose.monitoring.yml restart grafana
+```
+
+No external contact points or notification policies are provisioned. Existing
+policies are retained; on a fresh stack, view alerts in Grafana until notification
+delivery is configured. Stopping the application intentionally makes its targets
+unavailable and will trigger availability alerts after two minutes.
 
 No logs or request bodies are exported by this stack. It collects metrics only;
 it does not provision a log or distributed-trace backend.

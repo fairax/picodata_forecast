@@ -171,6 +171,12 @@ docker compose -f compose.monitoring.yml down --volumes
 Monitoring starts and stops independently of Cartridge. Dashboard definitions are
 managed by the repository; save a copy under a new name to customize one in Grafana.
 
+Grafana also includes provisioned alerts for unavailable instances, elevated errors
+and latency, concurrency rejections, cache failures, upstream instability, and
+memtx quota pressure. Open **Alerting → Alert rules** to inspect them. See the
+[thresholds and response steps](monitoring/ALERTS.md). No external notifications
+are configured by this setup; existing Grafana notification policies are retained.
+
 ### Known issues
 
 **Unbounded response buffering.**

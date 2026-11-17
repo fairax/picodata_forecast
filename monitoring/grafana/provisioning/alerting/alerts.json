@@ -1,0 +1,601 @@
+{
+  "apiVersion": 1,
+  "groups": [
+    {
+      "orgId": 1,
+      "name": "Open-Meteo alerts",
+      "folder": "Open-Meteo",
+      "interval": "30s",
+      "rules": [
+        {
+          "uid": "om-instance-unavailable",
+          "title": "Instance unavailable",
+          "condition": "C",
+          "for": "2m",
+          "noDataState": "Alerting",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "(1 - up{job=\"open-meteo\"}) or absent(up{job=\"open-meteo\"})",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "critical",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "Instance {{ $labels.instance }} is unavailable",
+            "description": "Check Prometheus target health and its scrape error, then instance process logs, the configured HTTP port, and container-to-host connectivity. Restore the process or network before changing scrape targets.",
+            "runbook": "monitoring/ALERTS.md#instance-unavailable",
+            "__dashboardUid__": "open-meteo-forecast",
+            "__panelId__": "10"
+          },
+          "dashboardUid": "open-meteo-forecast",
+          "panelId": 10
+        },
+        {
+          "uid": "om-forecast-errors",
+          "title": "Forecast errors",
+          "condition": "C",
+          "for": "5m",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "(sum by (instance) (rate(http_server_request_latency_count{job=\"open-meteo\",path=\"/forecast\",status=~\"[1-5][0-9][0-9]\",status=~\"5[0-9][0-9]\"}[5m])) / sum by (instance) (rate(http_server_request_latency_count{job=\"open-meteo\",path=\"/forecast\",status=~\"[1-5][0-9][0-9]\"}[5m])) > bool 0.05) * on (instance) (sum by (instance) (increase(http_server_request_latency_count{job=\"open-meteo\",path=\"/forecast\",status=~\"[1-5][0-9][0-9]\"}[5m])) >= bool 20)",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "critical",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "Forecast 5xx rate exceeds 5% on {{ $labels.instance }}",
+            "description": "Inspect status and upstream-attempt panels, then correlate client X-Request-ID with router and storage logs. Distinguish upstream failures, timeouts, internal failures, and concurrency rejections; restore the failing dependency before adding retries.",
+            "runbook": "monitoring/ALERTS.md#forecast-errors",
+            "__dashboardUid__": "open-meteo-forecast",
+            "__panelId__": "2"
+          },
+          "dashboardUid": "open-meteo-forecast",
+          "panelId": 2
+        },
+        {
+          "uid": "om-forecast-latency",
+          "title": "Forecast latency",
+          "condition": "C",
+          "for": "5m",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "(histogram_quantile(0.95, sum by (instance, le) (rate(http_server_request_latency_bucket{job=\"open-meteo\",path=\"/forecast\",status=~\"[1-5][0-9][0-9]\"}[5m]))) > bool 2) * on (instance) (sum by (instance) (increase(http_server_request_latency_count{job=\"open-meteo\",path=\"/forecast\",status=~\"[1-5][0-9][0-9]\"}[5m])) >= bool 20)",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "warning",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "Forecast p95 latency exceeds 2 seconds on {{ $labels.instance }}",
+            "description": "Compare cache outcomes, upstream attempt durations and retries, active fetches, and storage connectivity. Check upstream slowness and scheduler/CPU pressure. Measure before increasing concurrency or timeout settings.",
+            "runbook": "monitoring/ALERTS.md#forecast-latency",
+            "__dashboardUid__": "open-meteo-forecast",
+            "__panelId__": "3"
+          },
+          "dashboardUid": "open-meteo-forecast",
+          "panelId": 3
+        },
+        {
+          "uid": "om-fetch-capacity",
+          "title": "Fetch capacity exhausted",
+          "condition": "C",
+          "for": "2m",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "sum by (instance) (increase(forecast_rejected_requests_total{job=\"open-meteo\",reason=\"concurrency_limit\"}[5m])) >= bool 5",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "warning",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "At least five fetch rejections in five minutes on {{ $labels.instance }}",
+            "description": "Check active fetches, upstream latency/retries and cache misses. Reduce avoidable load or restore upstream health; review memory headroom before increasing OPEN_METEO_MAX_CONCURRENT_FETCHES.",
+            "runbook": "monitoring/ALERTS.md#fetch-capacity",
+            "__dashboardUid__": "open-meteo-forecast",
+            "__panelId__": "9"
+          },
+          "dashboardUid": "open-meteo-forecast",
+          "panelId": 9
+        },
+        {
+          "uid": "om-cache-failures",
+          "title": "Cache failures",
+          "condition": "C",
+          "for": "5m",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "sum by (instance, operation) (increase(forecast_cache_operations_total{job=\"open-meteo\",outcome=\"error\"}[5m])) >= bool 5",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "warning",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "Cache {{ $labels.operation }} failures on {{ $labels.instance }}",
+            "description": "Correlate cache error events with request IDs; check storage masters, vshard routing, bucket transfer state, and memory pressure. Forecasts may still succeed through best-effort fallback, but upstream load can rise.",
+            "runbook": "monitoring/ALERTS.md#cache-failures",
+            "__dashboardUid__": "open-meteo-forecast",
+            "__panelId__": "5"
+          },
+          "dashboardUid": "open-meteo-forecast",
+          "panelId": 5
+        },
+        {
+          "uid": "om-upstream-instability",
+          "title": "Upstream instability",
+          "condition": "C",
+          "for": "5m",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "(sum by (instance) (rate(forecast_upstream_attempts_total{job=\"open-meteo\",outcome=~\"transport|timeout\"}[5m]) or rate(forecast_upstream_attempts_total{job=\"open-meteo\",status=~\"429|5[0-9][0-9]\"}[5m])) / sum by (instance) (rate(forecast_upstream_attempts_total{job=\"open-meteo\"}[5m])) > bool 0.2) * on (instance) (sum by (instance) (increase(forecast_upstream_attempts_total{job=\"open-meteo\"}[5m])) >= bool 20)",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "warning",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "More than 20% of upstream attempts fail on {{ $labels.instance }}",
+            "description": "Inspect outcome/status breakdown and attempt logs. Check DNS, connectivity, upstream service health, throttling and Retry-After. Existing retries can hide instability from clients; avoid multiplying retries.",
+            "runbook": "monitoring/ALERTS.md#upstream-instability",
+            "__dashboardUid__": "open-meteo-forecast",
+            "__panelId__": "6"
+          },
+          "dashboardUid": "open-meteo-forecast",
+          "panelId": 6
+        },
+        {
+          "uid": "om-memtx-pressure",
+          "title": "Memtx quota pressure",
+          "condition": "C",
+          "for": "10m",
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "isPaused": false,
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "open-meteo-prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "open-meteo-prometheus"
+                },
+                "expr": "(tnt_slab_quota_used{job=\"open-meteo\"} / tnt_slab_quota_size{job=\"open-meteo\"}) > bool 0.9",
+                "instant": true,
+                "range": false,
+                "refId": "A",
+                "intervalMs": 15000,
+                "maxDataPoints": 43200
+              }
+            },
+            {
+              "refId": "C",
+              "relativeTimeRange": {
+                "from": 0,
+                "to": 0
+              },
+              "datasourceUid": "__expr__",
+              "model": {
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "refId": "C",
+                "type": "threshold",
+                "expression": "A",
+                "conditions": [
+                  {
+                    "type": "query",
+                    "evaluator": {
+                      "type": "gt",
+                      "params": [
+                        0
+                      ]
+                    },
+                    "operator": {
+                      "type": "and"
+                    },
+                    "query": {
+                      "params": [
+                        "C"
+                      ]
+                    },
+                    "reducer": {
+                      "type": "last",
+                      "params": []
+                    }
+                  }
+                ]
+              }
+            }
+          ],
+          "labels": {
+            "severity": "warning",
+            "service": "open-meteo"
+          },
+          "annotations": {
+            "summary": "Memtx allocated quota exceeds 90% on {{ $labels.instance }}",
+            "description": "Inspect Tarantool slab/live memory and cache cleanup/eviction, plus cache insertion errors. Allocated slabs can remain reserved after eviction, so this is pressure rather than proof of imminent OOM. Check fragmentation and host headroom before changing memtx_memory; do not blindly restart or raise limits.",
+            "runbook": "monitoring/ALERTS.md#memtx-pressure",
+            "__dashboardUid__": "open-meteo-tarantool",
+            "__panelId__": "59"
+          },
+          "dashboardUid": "open-meteo-tarantool",
+          "panelId": 59
+        }
+      ]
+    }
+  ]
+}
