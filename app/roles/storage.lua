@@ -128,10 +128,10 @@ return {
     init = init,
     apply_config = apply_config,
     stop = stop,
-    cache_get = function(query)
-        return lib:load('cache_get')(query)
+    cache_get = function(query, request_id)
+        return lib:load('cache_get')(query, request_id)
     end,
-    cache_put = function(query, bucket_id, response)
-        return lib:load('cache_put')(query, bucket_id, response)
+    cache_put = function(query, bucket_id, response, request_id)
+        return lib:load('cache_put')(query, bucket_id, response, request_id)
     end,
 }

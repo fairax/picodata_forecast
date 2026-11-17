@@ -17,6 +17,20 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Timeout(_) => "timeout",
+            Self::Transport(_) => "transport",
+            Self::Internal(_) => "internal",
+        }
+    }
+
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Timeout(detail) | Self::Transport(detail) | Self::Internal(detail) => detail,
+        }
+    }
+
     pub fn internal(error: impl std::fmt::Display) -> Self {
         Self::Internal(error.to_string())
     }
@@ -24,13 +38,11 @@ impl FetchError {
 
 impl From<FetchError> for Response {
     fn from(error: FetchError) -> Self {
-        let (status, body, detail) = match error {
-            FetchError::Timeout(detail) => (504, "Forecast request timed out", detail),
-            FetchError::Transport(detail) => (502, "Forecast service unavailable", detail),
-            FetchError::Internal(detail) => (500, "Internal server error", detail),
+        let (status, body) = match error {
+            FetchError::Timeout(_) => (504, "Forecast request timed out"),
+            FetchError::Transport(_) => (502, "Forecast service unavailable"),
+            FetchError::Internal(_) => (500, "Internal server error"),
         };
-        // Fetching and error reporting both run on the Tarantool thread.
-        tarantool::say_error!("Forecast request failed: {}", detail);
         Response {
             status,
             body: ByteBuf::from(body),
@@ -132,7 +144,10 @@ pub fn initialize() -> std::result::Result<(), FetchError> {
 /// The deadline gates attempts; fibreq uses separate phase timeouts,
 /// so one exchange can outlive the remaining overall budget. Responses are fully
 /// buffered without a size limit because fibreq 0.2 has no bounded body-reading API.
-pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchError> {
+pub fn fetch(
+    query: &NormalizedQuery,
+    request_id: &str,
+) -> std::result::Result<Response, FetchError> {
     let config = CONFIG
         .get()
         .ok_or_else(|| FetchError::internal("Forecast configuration has not been initialized"))?;
@@ -145,6 +160,7 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
         FetchError::internal("OPEN_METEO_TIMEOUT_SECS exceeds the supported deadline range")
     })?;
 
+    let mut retry_reason = String::new();
     for attempt in 0..3 {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -152,7 +168,38 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
                 "Forecast retry deadline exceeded".into(),
             ));
         }
-        let outcome = fetch_once(url.clone(), deadline);
+        let started = Instant::now();
+        let outcome = fetch_once(
+            url.clone(),
+            deadline,
+            request_id,
+            attempt + 1,
+            &retry_reason,
+        );
+        let attempted = !matches!(outcome, Err(AttemptError::Deadline));
+        let outcome = outcome.map_err(AttemptError::classify);
+        let (status, kind, detail) = match &outcome {
+            Ok(response) => (response.status, "response", ""),
+            Err(failure) => (0, failure.error.kind(), failure.error.detail()),
+        };
+        if attempted {
+            crate::observability::event(
+                if outcome.is_err() || status >= 400 {
+                    "warn"
+                } else {
+                    "debug"
+                },
+                "upstream_attempt",
+                request_id,
+                "",
+                kind,
+                attempt + 1,
+                status,
+                started.elapsed().as_secs_f64(),
+                0,
+                detail,
+            );
+        }
         let delay = Duration::from_millis(fastrand::u64(0..=200 * (1 << attempt)));
         let (last_outcome, delay) = match outcome {
             Ok(response) => {
@@ -165,10 +212,11 @@ pub fn fetch(query: &NormalizedQuery) -> std::result::Result<Response, FetchErro
                     .and_then(|values| values.last())
                     .and_then(|value| retry_after(value, SystemTime::now()))
                     .unwrap_or_default();
+                retry_reason = format!("http_{}", response.status);
                 (Ok(response), delay.max(retry_after))
             }
-            Err(error) => {
-                let failure = error.classify();
+            Err(failure) => {
+                retry_reason = failure.error.kind().to_owned();
                 if attempt == 2 || !failure.retryable {
                     return Err(failure.error);
                 }
@@ -255,6 +303,12 @@ enum AttemptError {
     Deadline,
 }
 
+impl From<Box<fibreq::Error>> for AttemptError {
+    fn from(error: Box<fibreq::Error>) -> Self {
+        Self::Http(error)
+    }
+}
+
 struct ClassifiedFailure {
     error: FetchError,
     retryable: bool,
@@ -302,10 +356,30 @@ impl AttemptError {
     }
 }
 
-fn fetch_once(url: url::Url, deadline: Instant) -> std::result::Result<Response, AttemptError> {
+fn fetch_once(
+    url: url::Url,
+    deadline: Instant,
+    request_id: &str,
+    attempt: u64,
+    retry_reason: &str,
+) -> std::result::Result<Response, AttemptError> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err(AttemptError::Deadline);
+    }
+    if attempt > 1 {
+        crate::observability::event(
+            "debug",
+            "upstream_retry",
+            request_id,
+            "",
+            retry_reason,
+            attempt,
+            0,
+            0.0,
+            0,
+            "",
+        );
     }
     let timeout = remaining.min(Duration::from_secs(10));
     // A private client per exchange avoids reusing a socket before its body
@@ -316,13 +390,11 @@ fn fetch_once(url: url::Url, deadline: Instant) -> std::result::Result<Response,
         .pool_acquire_timeout(timeout)
         .build();
     let mut response = client
-        .get(url.as_str())
-        .map_err(AttemptError::Http)?
+        .get(url.as_str())?
         .tls_timeout(timeout)
         .request_timeout(timeout)
         .response_timeout(timeout)
-        .send()
-        .map_err(AttemptError::Http)?;
+        .send()?;
     let status = response.status() as u16;
     let headers = response
         .headers()
@@ -344,7 +416,7 @@ fn fetch_once(url: url::Url, deadline: Instant) -> std::result::Result<Response,
         Vec::new()
     } else {
         let expected = response.content_length();
-        let bytes = response.bytes().map_err(AttemptError::Http)?;
+        let bytes = response.bytes()?;
         if let Some(expected) = expected {
             if bytes.len() as u64 != expected {
                 return Err(AttemptError::IncompleteBody {

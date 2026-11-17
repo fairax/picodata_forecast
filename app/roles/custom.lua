@@ -1,7 +1,8 @@
 -- luacheck: globals box.lib.load
 
 local cartridge = require('cartridge')
-local log = require('log')
+local obs = require('app.observability')
+local clock = require('clock')
 local fiber = require('fiber')
 
 -- Retain the module so its process-local configuration survives Lua GC.
@@ -10,55 +11,60 @@ local max_concurrent_fetches
 local active_fetches = 0
 local forecast_route_name = 'app.roles.custom.forecast'
 
-local function cache_get(query, bucket_id)
+local function cache_get(query, bucket_id, request_id)
+    local started = clock.monotonic()
     local ok, response, err = pcall(require('vshard').router.callrw,
-        bucket_id, 'forecast.cache_get', {query}, {timeout = 1})
-    if not ok then
-        log.error('Forecast cache lookup failed: %s', tostring(response))
-        return nil
-    end
-    if err ~= nil then log.error('Forecast cache lookup failed: %s', tostring(err)) end
-    return response
+        bucket_id, 'forecast.cache_get', {query, request_id}, {timeout = 1})
+    if not ok then err, response = response, nil end
+    local hit = response ~= nil and response ~= box.NULL
+    local outcome = err ~= nil and 'error' or (hit and 'hit' or 'miss')
+    obs.cache(request_id, 'get', outcome, started, bucket_id, err and tostring(err))
+    return err == nil and response or nil
 end
 
-local function cache_put(query, bucket_id, response)
+local function cache_put(query, bucket_id, response, request_id)
+    local started = clock.monotonic()
     local ok, result, err = pcall(require('vshard').router.callrw,
-        bucket_id, 'forecast.cache_put', {query, bucket_id, response}, {timeout = 1})
-    if not ok then
-        log.error('Forecast cache insertion failed: %s', tostring(result))
-        return nil
-    end
-    if err ~= nil then log.error('Forecast cache insertion failed: %s', tostring(err)) end
+        bucket_id, 'forecast.cache_put', {query, bucket_id, response, request_id}, {timeout = 1})
+    if not ok then err, result = result, nil end
+    obs.cache(request_id, 'put', err ~= nil and 'error' or 'success', started, bucket_id, err and tostring(err))
     return result
 end
 
-local function fetch(query)
+local function fetch(query, request_id)
+    request_id = obs.request_id(request_id)
     query = lib:load('normalize_query')(query)
     local bucket_id = require('vshard').router.bucket_id_strcrc32(query)
-    local response = cache_get(query, bucket_id)
+    local response = cache_get(query, bucket_id, request_id)
     if response ~= nil and response ~= box.NULL then return response end
 
     if active_fetches >= max_concurrent_fetches then
+        obs.reject(request_id)
         return {status = 503, body = 'Forecast service busy', headers = {['content-type'] = {'text/plain'}}}
     end
     local completion = fiber.channel(1)
     -- No yield between checking the limit and reserving a permit.
     active_fetches = active_fetches + 1
+    obs.active(active_fetches)
     -- SDK 6's I/O executor cannot safely unwind a cancelled fiber. Keep native
     -- I/O on an independent fiber; caller cancellation must not free its slot.
     local started, err = pcall(fiber.new, function()
         local ok, result = pcall(function()
-            local fetched = lib:load('fetch_forecast')(query)
+            local fetched = lib:load('fetch_forecast')(query, request_id)
             if fetched.status >= 200 and fetched.status < 300 and #fetched.body > 0 then
-                cache_put(query, bucket_id, fetched)
+                cache_put(query, bucket_id, fetched, request_id)
+            else
+                obs.cache(request_id, 'put', 'skipped', clock.monotonic(), bucket_id)
             end
             return fetched
         end)
         active_fetches = active_fetches - 1
+        obs.active(active_fetches)
         completion:put({ok = ok, result = result}, 0)
     end)
     if not started then
         active_fetches = active_fetches - 1
+        obs.active(active_fetches)
         error(err, 0)
     end
     local outcome = completion:get()
@@ -117,13 +123,35 @@ local function init(opts) -- luacheck: no unused args
     end
     lib = lib or box.lib.load('forecast')
     lib:load('init_forecast')()
+    obs.active(active_fetches)
 
     local httpd = assert(cartridge.service_get('httpd'), "Failed to get httpd service")
-    httpd:route({name = forecast_route_name, method = 'GET', path = '/forecast'}, function(request)
-        local response = fetch(request.query or '')
-
-        return {status = response.status, body = response.body, headers = filter_headers(response.headers)}
-    end)
+    local handler = function(request)
+        local request_id = obs.request_id((request.headers or {})['x-request-id'])
+        local started = clock.monotonic()
+        local ok, response = pcall(fetch, request.query or '', request_id)
+        if not ok then
+            local cancelled = type(response) == 'cdata' and response.type == 'FiberIsCancelled'
+            obs.event(cancelled and 'info' or 'error',
+                cancelled and 'request_completed' or 'request_failed', request_id,
+                {outcome = cancelled and 'cancelled' or 'error',
+                    error_kind = cancelled and 'cancelled' or 'internal', status = not cancelled and 500 or nil,
+                    duration_seconds = clock.monotonic() - started, detail = tostring(response)})
+            if cancelled then error(response, 0) end
+            response = {status = 500, body = 'Internal server error',
+                headers = {['content-type'] = {'text/plain; charset=utf-8'}}}
+        end
+        obs.event('info', 'request_completed', request_id,
+            {outcome = ok and 'response' or 'error', status = response.status,
+                duration_seconds = clock.monotonic() - started})
+        local headers = filter_headers(response.headers)
+        for name in pairs(headers) do
+            if name:lower() == 'x-request-id' then headers[name] = nil end
+        end
+        headers['x-request-id'] = {request_id}
+        return {status = response.status, body = response.body, headers = headers}
+    end
+    httpd:route({name = forecast_route_name, method = 'GET', path = '/forecast'}, obs.wrap_http(handler))
 
     return true
 end

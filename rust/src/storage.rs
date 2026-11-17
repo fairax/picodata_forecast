@@ -88,7 +88,7 @@ pub fn add_cache_entry(
     Ok(())
 }
 
-pub fn get_cache_entry(key: &str) -> Result<Option<Response>> {
+pub fn get_cache_entry(key: &str, request_id: &str) -> Result<Option<Response>> {
     let forecast_cache = forecast_cache()?;
     let Some(tuple) = forecast_cache.get(&(key,))? else {
         return Ok(None);
@@ -97,7 +97,18 @@ pub fn get_cache_entry(key: &str) -> Result<Option<Response>> {
     let timestamp = now();
     if entry.expires_at()? <= timestamp {
         if let Err(error) = forecast_cache.delete(&(key,)) {
-            tarantool::say_error!("Expired cache entry deletion failed: {}", error);
+            crate::observability::event(
+                "warn",
+                "cache_expired_delete_failure",
+                request_id,
+                "get",
+                "error",
+                0,
+                0,
+                0.0,
+                0,
+                &error.to_string(),
+            );
         }
         return Ok(None);
     }
@@ -109,7 +120,18 @@ pub fn get_cache_entry(key: &str) -> Result<Option<Response>> {
         Ok(())
     })();
     if let Err(error) = touch {
-        tarantool::say_error!("Cache access time update failed: {}", error);
+        crate::observability::event(
+            "warn",
+            "cache_touch_failure",
+            request_id,
+            "get",
+            "error",
+            0,
+            0,
+            0.0,
+            0,
+            &error.to_string(),
+        );
     }
     result.headers.insert("x-cache".into(), vec!["HIT".into()]);
     Ok(Some(result))

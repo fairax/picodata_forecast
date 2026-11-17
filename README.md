@@ -87,6 +87,39 @@ A fetch occupies a slot through retries and cache insertion. Disconnecting a cli
 does not stop its ongoing fetch or immediately free its slot. The limit applies
 independently to each router and does not cap total memory usage.
 
+### Request tracing and metrics
+
+Every `/forecast` response includes `X-Request-ID`. Valid incoming IDs are reused;
+otherwise a UUID is generated. IDs must contain 1–128 ASCII letters, digits,
+periods, underscores, colons, or hyphens. Repeated or invalid IDs are replaced.
+The same ID identifies related router and storage logs, including upstream attempts
+and retries. It is not sent to the upstream service. Cache hits return the current
+request's ID, never a cached ID.
+
+Structured log events include the request ID, instance UUID, duration, and relevant
+status, bucket, attempt, and error classification. Completion summaries are logged
+at info, stage details at debug, and failures at warning/error. Existing log output
+settings are retained. Bodies and full queries are not included in request events.
+
+The `/metrics` endpoint exports HTTP request counts and latency as
+`http_server_request_latency_count`, `_sum`, and `_bucket`, plus:
+
+| Metric | Meaning |
+| --- | --- |
+| `forecast_cache_operations_total` | Cache operations by operation and outcome |
+| `forecast_upstream_attempts_total` | Upstream attempts by outcome and status |
+| `forecast_upstream_attempt_duration_seconds` | Upstream attempt duration histogram |
+| `forecast_upstream_retries_total` | Retries actually started, by reason |
+| `forecast_active_fetches` | Fetches still occupying a concurrency slot |
+| `forecast_rejected_requests_total` | Requests rejected by the concurrency limit |
+
+Request IDs, queries, and bucket IDs are excluded from metric labels. Observations
+use `status="cancelled"` when a handler is cancelled without a response. Histogram
+boundaries range from 1 ms to 120 seconds, with an overflow bucket. Request tracing
+does not change retry or caching behavior; disconnected callers' fetches can
+continue and retain their request IDs until completion. Deploy and restart routers
+and storage instances together to load these changes.
+
 ### Known issues
 
 **Unbounded response buffering.**

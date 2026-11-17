@@ -1,5 +1,6 @@
 local t = require('luatest')
 local fiber = require('fiber')
+local clock = require('clock')
 local fio = require('fio')
 local http = require('http.server')
 local cartridge_helpers = require('cartridge.test-helpers')
@@ -72,13 +73,15 @@ g.before_all(function(cg)
         local retry_after = action.retry_after
         if retry_after == nil then retry_after = cg.retry_after end
         if retry_after == false then retry_after = nil end
+        table.insert(cg.upstream_request_ids, req.headers['x-request-id'] or false)
         table.insert(cg.request_times, fiber.clock())
-        table.insert(cg.request_wall_times, fiber.time())
+        table.insert(cg.request_wall_times, clock.realtime())
         entered:put(true)
         if not cg.auto_respond and action.gated ~= false then gate:get(40) end
         return {status = status, body = body, headers = {
             ['content-type'] = action.content_type or 'text/plain', ['retry-after'] = retry_after,
             ['location'] = action.location, ['content-encoding'] = action.content_encoding,
+            ['x-request-id'] = action.response_request_id,
         }}
     end)
     cg.mock:start()
@@ -130,6 +133,7 @@ g.before_each(function(cg)
     cg.gate = fiber.channel(10)
     cg.entered = fiber.channel(100)
     cg.requests = 0
+    cg.upstream_request_ids = {}
     cg.request_times = {}
     cg.request_wall_times = {}
     cg.auto_respond = false
@@ -151,6 +155,18 @@ local function set_router_role(cg, enabled)
 end
 
 g.after_each(function(cg)
+    for _, server in ipairs(cg.cluster.servers) do
+        if server.net_box ~= nil then
+            server.net_box:eval([[
+            local saved = rawget(_G, 'observability_saved_log')
+            if saved then
+                for level, fn in pairs(saved) do require('log').new('app.observability')[level] = fn end
+                rawset(_G, 'observability_saved_log', nil)
+                rawset(_G, 'observability_events', nil)
+            end
+            ]])
+        end
+    end
     cg.cluster.servers[2].env.SSL_CERT_FILE = nil
     if cg.router_role_disabled then
         set_router_role(cg, true)
@@ -551,7 +567,7 @@ g.test_retry_after_http_date = function(cg)
     cg.actions = {{status = 503, retry_after = date}, {status = 200}}
     t.assert_equals(fetch(cg, 'retry=date').response.status, 200)
     t.assert_equals(cg.requests, 2)
-    t.assert(cg.request_wall_times[2] >= deadline)
+    t.assert(cg.request_wall_times[2] >= deadline, tostring(cg.request_wall_times[2] - deadline))
 end
 
 g.test_malformed_and_absent_retry_after_are_ignored = function(cg)
@@ -993,7 +1009,7 @@ g.test_native_fetch_on_router_does_not_access_cache = function(cg)
     cg.auto_respond = true
     local response = cg.cluster.servers[2].net_box:eval([[
         assert(box.space.forecast_cache == nil)
-        return box.lib.load('forecast'):load('fetch_forecast')('native=router')
+        return box.lib.load('forecast'):load('fetch_forecast')('native=router', 'native-test')
     ]])
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, 'native=router')
@@ -1104,10 +1120,11 @@ g.test_repeated_retry_after_preserves_last_value_policy = function(cg)
     t.assert_equals(cg.requests, 3)
 end
 
-local function raw_http_response(router, path)
+local function raw_http_response(router, path, extra_headers)
     local socket = require('socket')
     local conn = assert(socket.tcp_connect('127.0.0.1', router.http_port, 5))
-    assert(conn:write('GET ' .. path .. ' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n', 5))
+    assert(conn:write('GET ' .. path .. ' HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n' ..
+        (extra_headers or '') .. '\r\n', 5))
     local raw = assert(conn:read({delimiter = '\r\n\r\n'}, 5))
     local headers = {}
     for name, value in raw:gmatch('([^\r\n:]+): ([^\r\n]*)\r\n') do
@@ -1188,7 +1205,7 @@ g.test_cached_headers_filtered_case_insensitively = function(cg)
                 ['X-Safe-Values'] = {'first', 'bad\r\ninjection', 'second'},
                 ['X-Only-Unsafe'] = {'bad\nvalue'},
             },
-        })
+        }, 'cache-test')
     ]], {query, bucket})
     local response = cg.cluster.servers[2]:http_request('get', '/forecast?' .. query)
     t.assert_equals(response.status, 200)
@@ -1302,4 +1319,363 @@ g.test_fibreq_https_with_trusted_test_certificate = function(cg)
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, 'ok')
     t.assert_equals(fault_state(cg).count, 1)
+end
+
+local function request_with_id(cg, query, request_id)
+    return cg.cluster.servers[2]:http_request('get', '/forecast?' .. query,
+        {raise = false, http = {headers = {['X-Request-ID'] = request_id}}})
+end
+
+local function capture_events(cg)
+    for _, server in ipairs(cg.cluster.servers) do
+        server.net_box:eval([[
+            local log = require('log').new('app.observability')
+            local saved, events = {}, {}
+            rawset(_G, 'observability_saved_log', saved)
+            rawset(_G, 'observability_events', events)
+            for _, level in ipairs({'debug', 'info', 'warn', 'error'}) do
+                saved[level] = log[level]
+                log[level] = function(record, ...)
+                    if type(record) == 'table' and record.request_id then
+                        local copy = table.copy(record)
+                        copy.level = level
+                        events[#events + 1] = copy
+                    end
+                    return saved[level](record, ...)
+                end
+            end
+        ]])
+    end
+end
+
+local function metric(cg, name, labels)
+    return cg.cluster.servers[2].net_box:eval([[
+        local name, labels = ...
+        local total = 0
+        for _, sample in ipairs(require('metrics').collect()) do
+            if sample.metric_name == name then
+                local matches = true
+                for k, v in pairs(labels or {}) do
+                    if sample.label_pairs[k] ~= v then matches = false end
+                end
+                if matches then total = total + sample.value end
+            end
+        end
+        return total
+    ]], {name, labels or {}})
+end
+
+g.test_observability_request_ids_are_current_and_never_cached = function(cg)
+    cg.auto_respond = true
+    cg.actions = {{response_request_id = 'upstream-response-id'}}
+    local first = request_with_id(cg, 'trace=cache', 'client.first:1')
+    t.assert_equals(first.headers['x-request-id'], 'client.first:1')
+    t.assert_equals(cg.upstream_request_ids, {false})
+    local hit = request_with_id(cg, 'trace=cache', 'client.second:2')
+    t.assert_equals(hit.headers['x-request-id'], 'client.second:2')
+    t.assert_equals(hit.headers['x-cache'], 'HIT')
+    t.assert_equals(cg.requests, 1)
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        t.assert_equals(server.net_box:eval([[
+            for _, tuple in box.space.forecast_cache:pairs() do
+                for name in pairs(tuple[5]) do
+                    if name:lower() == 'x-request-id' then return false end
+                end
+            end
+            return true
+        ]]), true)
+    end
+    local previous
+    for i, value in ipairs({'', 'contains spaces', 'first, second', string.rep('x', 129)}) do
+        local response = request_with_id(cg, 'trace=invalid-' .. i, value)
+        local id = response.headers['x-request-id']
+        t.assert_equals(#id, 36)
+        t.assert(require('uuid').fromstr(id) ~= nil)
+        t.assert(id ~= previous)
+        previous = id
+    end
+    local generated = cg.cluster.servers[2]:http_request('get', '/forecast?trace=generated')
+    t.assert_equals(#generated.headers['x-request-id'], 36)
+end
+
+g.test_observability_correlates_stages_and_counts_retries = function(cg)
+    capture_events(cg)
+    cg.auto_respond = true
+    cg.actions = {{status = 503}, {status = 200}}
+    local attempts = metric(cg, 'forecast_upstream_attempts_total')
+    local retries = metric(cg, 'forecast_upstream_retries_total')
+    local misses = metric(cg, 'forecast_cache_operations_total', {operation = 'get', outcome = 'miss'})
+    local http_count = metric(cg, 'http_server_request_latency_count', {path = '/forecast', method = 'GET'})
+    local response = request_with_id(cg, 'trace=retry', 'shared-trace')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(cg.upstream_request_ids, {false, false})
+    t.assert_equals(metric(cg, 'forecast_upstream_attempts_total') - attempts, 2)
+    t.assert_equals(metric(cg, 'forecast_upstream_retries_total') - retries, 1)
+    t.assert_equals(metric(cg, 'forecast_cache_operations_total',
+        {operation = 'get', outcome = 'miss'}) - misses, 1)
+    t.assert_equals(metric(cg, 'http_server_request_latency_count',
+        {path = '/forecast', method = 'GET'}) - http_count, 1)
+    t.assert_equals(metric(cg, 'forecast_active_fetches'), 0)
+    local seen, summaries, storage_events = {}, 0, 0
+    for _, server in ipairs(cg.cluster.servers) do
+        local events = server.net_box:eval('return observability_events')
+        for _, event in ipairs(events) do
+            t.assert_equals(event.request_id, 'shared-trace')
+            t.assert_equals(event.instance_uuid, server.instance_uuid)
+            t.assert(event.duration_seconds == nil or event.duration_seconds >= 0)
+            if event.event == 'request_completed' then
+                summaries = summaries + 1
+                t.assert_equals(event.level, 'info')
+                t.assert_equals(event.status, 200)
+            elseif event.event == 'upstream_attempt' or event.event == 'cache_get' then
+                t.assert_equals(event.level, event.status and event.status >= 400 and 'warn' or 'debug')
+            end
+            if event.event:match('^storage_cache') then storage_events = storage_events + 1 end
+            seen[event.event] = true
+        end
+    end
+    t.assert_equals(summaries, 1)
+    t.assert(storage_events >= 2)
+    t.assert(seen.cache_get and seen.cache_put and seen.upstream_attempt and seen.upstream_retry)
+    t.assert(metric(cg, 'forecast_upstream_attempt_duration_seconds_sum') > 0)
+    t.assert_str_contains(cg.cluster.servers[2]:http_request('get', '/metrics').body,
+        'forecast_upstream_attempts_total')
+end
+
+g.test_observability_concurrent_requests_keep_distinct_context = function(cg)
+    capture_events(cg)
+    local router = cg.cluster.servers[2]
+    local futures = {}
+    for i = 1, 2 do
+        futures[i] = router.net_box:eval([[
+            local i = ...
+            return require('app.roles.custom').fetch('trace=parallel-' .. i, 'parallel-' .. i)
+        ]], {i}, {is_async = true, timeout = 35})
+    end
+    for _ = 1, 2 do t.assert_equals(cg.entered:get(5), true) end
+    t.assert_equals(metric(cg, 'forecast_active_fetches'), 2)
+    for _ = 1, 2 do cg.gate:put(true) end
+    for _, future in ipairs(futures) do t.assert_equals(assert(future:wait_result(5))[1].status, 200) end
+    t.assert_equals(cg.upstream_request_ids, {false, false})
+    t.assert_equals(metric(cg, 'forecast_active_fetches'), 0)
+end
+
+g.test_observability_internal_errors_are_generic_with_request_id = function(cg)
+    local router = cg.cluster.servers[2]
+    router.net_box:eval([[
+        local vshard = require('vshard')
+        rawset(_G, 'observability_saved_bucket', vshard.router.bucket_id_strcrc32)
+        vshard.router.bucket_id_strcrc32 = function() error('private application detail') end
+    ]])
+    local ok, response = pcall(request_with_id, cg, 'trace=internal', 'internal-trace')
+    router.net_box:eval([[
+        require('vshard').router.bucket_id_strcrc32 = observability_saved_bucket
+        rawset(_G, 'observability_saved_bucket', nil)
+    ]])
+    t.assert(ok, tostring(response))
+    t.assert_equals(response.status, 500)
+    t.assert_equals(response.body, 'Internal server error')
+    t.assert_equals(response.headers['x-request-id'], 'internal-trace')
+end
+
+g.test_observability_instrumentation_failures_do_not_replace_result = function(cg)
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    router.net_box:eval([[
+        local metrics = require('metrics')
+        rawset(_G, 'observability_saved_collectors', {})
+        for _, collector in pairs(metrics.collectors()) do
+            if collector.name:match('^forecast_') or collector.name == 'http_server_request_latency' then
+                local originals = {}
+                observability_saved_collectors[collector] = originals
+                for _, method in ipairs({'inc', 'set', 'observe'}) do
+                    if collector[method] then
+                        originals[method] = collector[method]
+                        collector[method] = function() error('injected metrics failure') end
+                    end
+                end
+            end
+        end
+    ]])
+    local ok, response = pcall(request_with_id, cg, 'trace=broken-metrics', 'metrics-trace')
+    router.net_box:eval([[
+        for collector, methods in pairs(observability_saved_collectors) do
+            for method, fn in pairs(methods) do collector[method] = fn end
+        end
+        rawset(_G, 'observability_saved_collectors', nil)
+    ]])
+    t.assert(ok, tostring(response))
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'trace=broken-metrics')
+    t.assert_equals(response.headers['x-request-id'], 'metrics-trace')
+end
+
+g.test_observability_wrapped_cancellation_preserves_error_and_counts_once = function(cg)
+    local result = cg.cluster.servers[2].net_box:eval([[
+        local fiber = require('fiber')
+        local obs = require('app.observability')
+        local original, received, calls
+        calls = 0
+        local wrapped = obs.wrap_http(function()
+            calls = calls + 1
+            local _, err = pcall(fiber.sleep, 100)
+            original = err
+            error(err, 0)
+        end)
+        local task = fiber.create(function()
+            local ok, err = pcall(wrapped, {endpoint = {path = '/wrapped-cancellation', method = 'GET'}})
+            received = {ok = ok, same = rawequal(err, original), kind = err.type}
+        end)
+        task:set_joinable(true)
+        task:cancel()
+        task:join()
+        received.calls = calls
+        return received
+    ]])
+    t.assert_equals(result, {ok = false, same = true, kind = 'FiberIsCancelled', calls = 1})
+    t.assert_equals(metric(cg, 'http_server_request_latency_count',
+        {path = '/wrapped-cancellation', method = 'GET', status = 'cancelled'}), 1)
+end
+
+g.test_observability_wrapped_outcomes_survive_metric_errors = function(cg)
+    cg.cluster.servers[2].net_box:eval([[
+        local t = require('luatest')
+        local obs = require('app.observability')
+        local collector
+        for _, candidate in pairs(require('metrics').collectors()) do
+            if candidate.name == 'http_server_request_latency' then collector = candidate end
+        end
+        local request = {endpoint = {path = '/wrapped-outcome', method = 'GET'}}
+        local response, original, calls = {status = 202, body = 'accepted'}, {}, 0
+        local function check()
+            local returned = obs.wrap_http(function() calls = calls + 1; return response end)(request)
+            t.assert(rawequal(returned, response))
+            local ok, err = pcall(obs.wrap_http(function() calls = calls + 1; error(original, 0) end), request)
+            t.assert_not(ok)
+            t.assert(rawequal(err, original))
+        end
+        check()
+        local observe = collector.observe
+        collector.observe = function() error('injected observation failure') end
+        local ok, err = pcall(check)
+        collector.observe = observe
+        t.assert(ok, tostring(err))
+        t.assert_equals(calls, 4)
+    ]])
+    for _, status in ipairs({202, 500}) do
+        t.assert_equals(metric(cg, 'http_server_request_latency_count',
+            {path = '/wrapped-outcome', method = 'GET', status = status}), 1)
+    end
+end
+
+g.test_observability_wrapped_default_status_and_string_error = function(cg)
+    cg.cluster.servers[2].net_box:eval([[
+        local t = require('luatest')
+        local obs = require('app.observability')
+        local request = {endpoint = {path = '/wrapped-default', method = 'GET'}}
+        local response, calls = {body = 'ok'}, 0
+        local returned = obs.wrap_http(function() calls = calls + 1; return response end)(request)
+        t.assert(rawequal(returned, response))
+        local ok, err = pcall(obs.wrap_http(function()
+            calls = calls + 1
+            error('original handler error', 0)
+        end), request)
+        t.assert_not(ok)
+        -- The library may prefix string errors with its source location.
+        t.assert_str_contains(err, 'original handler error')
+        t.assert_equals(calls, 2)
+    ]])
+    for _, status in ipairs({200, 500}) do
+        t.assert_equals(metric(cg, 'http_server_request_latency_count',
+            {path = '/wrapped-default', method = 'GET', status = status}), 1)
+    end
+end
+
+g.test_observability_repeated_incoming_ids_generate_uuid = function(cg)
+    cg.auto_respond = true
+    local response = raw_http_response(cg.cluster.servers[2], '/forecast?trace=duplicate',
+        'X-Request-ID: first\r\nX-Request-ID: second\r\n')
+    t.assert_equals(response.status, 200)
+    local id = response.headers['x-request-id']
+    t.assert_equals(#id, 36)
+    t.assert(require('uuid').fromstr(id) ~= nil)
+    t.assert_equals(cg.upstream_request_ids, {false})
+end
+
+g.test_observability_cancelled_parent_retains_permit_and_context = function(cg)
+    configure(cg, cg.endpoint, '30', '1')
+    local rejected = metric(cg, 'forecast_rejected_requests_total', {reason = 'concurrency_limit'})
+    local router = cg.cluster.servers[2]
+    router.net_box:eval([[
+        local fiber = require('fiber')
+        rawset(_G, 'observability_parent_done', false)
+        rawset(_G, 'observability_parent', fiber.new(function()
+            pcall(require('app.roles.custom').fetch, 'trace=cancelled', 'cancelled-trace')
+            rawset(_G, 'observability_parent_done', true)
+        end))
+    ]])
+    t.assert_equals(cg.entered:get(5), true)
+    t.assert_equals(metric(cg, 'forecast_active_fetches'), 1)
+    router.net_box:eval("require('fiber').create(function() observability_parent:cancel() end)")
+    fiber.sleep(0.05)
+    local busy = request_with_id(cg, 'trace=busy', 'busy-trace')
+    t.assert_equals(busy.status, 503)
+    t.assert_equals(busy.headers['x-request-id'], 'busy-trace')
+    t.assert_equals(metric(cg, 'forecast_rejected_requests_total', {reason = 'concurrency_limit'}) - rejected, 1)
+    t.assert_equals(metric(cg, 'forecast_active_fetches'), 1)
+    t.assert_equals(cg.upstream_request_ids, {false})
+    cg.gate:put(true)
+    t.helpers.retrying({timeout = 5}, function()
+        t.assert_equals(metric(cg, 'forecast_active_fetches'), 0)
+        t.assert_equals(router.net_box:eval('return observability_parent_done'), true)
+    end)
+end
+
+g.test_observability_storage_warning_keeps_cached_response = function(cg)
+    cg.auto_respond = true
+    request_with_id(cg, 'trace=touch', 'initial-trace')
+    capture_events(cg)
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        server.net_box:eval([[
+            rawset(_G, 'cache_failure_trigger', function() error('injected touch error') end)
+            box.space.forecast_cache:before_replace(cache_failure_trigger)
+        ]])
+    end
+    local response = request_with_id(cg, 'trace=touch', 'touch-trace')
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.headers['x-cache'], 'HIT')
+    local warnings = 0
+    for _, server in ipairs({cg.cluster.servers[1], cg.cluster.servers[3]}) do
+        for _, event in ipairs(server.net_box:eval('return observability_events')) do
+            if event.event == 'cache_touch_failure' then
+                warnings = warnings + 1
+                t.assert_equals(event.request_id, 'touch-trace')
+                t.assert_equals(event.level, 'warn')
+                t.assert_equals(event.error_kind, 'storage')
+            end
+        end
+    end
+    t.assert_equals(warnings, 1)
+end
+
+g.test_observability_metric_labels_stay_bounded_and_config_is_idempotent = function(cg)
+    cg.auto_respond = true
+    local router = cg.cluster.servers[2]
+    local before = metric(cg, 'http_server_request_latency_count', {path = '/forecast', method = 'GET'})
+    request_with_id(cg, 'trace=labels', 'unique-label-test')
+    router.net_box:eval([[
+        local role = require('app.roles.custom')
+        for _ = 1, 3 do role.apply_config(nil, {is_master = true}) end
+        for _, sample in ipairs(require('metrics').collect()) do
+            if sample.metric_name:match('^forecast_') then
+                for name, value in pairs(sample.label_pairs) do
+                    assert(name ~= 'request_id' and name ~= 'query' and name ~= 'bucket_id')
+                    assert(value ~= 'unique-label-test' and value ~= 'trace=labels')
+                end
+            end
+        end
+    ]])
+    request_with_id(cg, 'trace=labels', 'other-label-test')
+    t.assert_equals(metric(cg, 'http_server_request_latency_count',
+        {path = '/forecast', method = 'GET'}) - before, 2)
 end

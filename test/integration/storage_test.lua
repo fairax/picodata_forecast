@@ -10,6 +10,7 @@ local function call(cg, name, ...)
         local name, args = ...
         local lib = box.lib.load('forecast')
         local func = lib:load(name)
+        if name == 'cache_get' or name == 'cache_put' then args[#args + 1] = require('uuid').str() end
         return func(unpack(args))
     ]], {name, {...}})
 end

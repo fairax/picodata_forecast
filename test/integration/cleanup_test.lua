@@ -156,8 +156,9 @@ g.test_real_promotion_moves_cleanup_to_new_master = function(cg)
     end)
     local response = replica.net_box:eval([[
         local lib = box.lib.load('forecast')
-        lib:load('cache_put')('promotion-hit', 1, {status = 200, body = 'promoted', headers = {type = {'text'}}})
-        return lib:load('cache_get')('promotion-hit')
+        lib:load('cache_put')('promotion-hit', 1,
+            {status = 200, body = 'promoted', headers = {type = {'text'}}}, 'cleanup-test')
+        return lib:load('cache_get')('promotion-hit', 'cleanup-test')
     ]])
     t.assert_equals(response.body, 'promoted')
     t.assert_equals(response.headers['x-cache'], {'HIT'})
@@ -337,7 +338,7 @@ g.test_eviction_batches_and_lru_order = function(cg)
         end
         local lib = box.lib.load('forecast')
         -- Accessing the oldest entry moves it to the end of the LRU index.
-        lib:load('cache_get')('001')
+        lib:load('cache_get')('001', 'cleanup-test')
         local evict = lib:load('evict_cache')
         local fiber = require('fiber')
         local before = fiber.info()[fiber.self():id()].csw
