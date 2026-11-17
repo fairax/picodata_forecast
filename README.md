@@ -120,6 +120,57 @@ does not change retry or caching behavior; disconnected callers' fetches can
 continue and retain their request IDs until completion. Deploy and restart routers
 and storage instances together to load these changes.
 
+### Grafana and Prometheus
+
+Start the application with the quick-start commands above, then start monitoring:
+
+```bash
+docker compose -f compose.monitoring.yml up -d
+```
+
+Docker Desktop users must enable WSL integration for their distribution first.
+Open [Grafana](http://localhost:3000), log in with `admin` / `admin`, and change the
+password when prompted. The **Open-Meteo** folder contains the **Forecast proxy**
+and **Tarantool Cartridge dashboard** dashboards, already connected to Prometheus.
+Both support instance filtering.
+
+The forecast dashboard shows request rates, statuses, p95 latency, cache hit ratio,
+cache errors, upstream attempts and retries, active fetches, and rejections.
+Send `/forecast` requests to populate request metrics. Metrics appear after their
+first event; rate graphs need at least two scrapes. An empty panel can mean no
+matching events have occurred. The cache hit ratio excludes lookup errors.
+
+[Prometheus](http://localhost:9090) collects all five instances every 15 seconds
+and retains data for 15 days. Check its **Status → Target health** page if graphs
+are empty. Stopped application instances appear as unavailable targets.
+The monitoring services are exposed only on localhost.
+
+The targets in [monitoring/prometheus.yml](monitoring/prometheus.yml) use
+`host.docker.internal` on ports 8081–8085. This address must reach the host running
+Cartridge from inside Docker. If Docker Desktop cannot reach your WSL app,
+replace that hostname in the targets with your WSL distribution's reachable IP
+(find it with `hostname -I`). Ensure the app's HTTP listeners are reachable on
+that interface, then restart Prometheus:
+
+```bash
+docker compose -f compose.monitoring.yml restart prometheus
+```
+
+Stop monitoring without removing its stored metrics, Grafana settings, or password:
+
+```bash
+docker compose -f compose.monitoring.yml down
+```
+
+To deliberately delete all monitoring data and reset Grafana's login:
+
+```bash
+docker compose -f compose.monitoring.yml down --volumes
+```
+
+Monitoring starts and stops independently of Cartridge. Dashboard definitions are
+managed by the repository; save a copy under a new name to customize one in Grafana.
+
 ### Known issues
 
 **Unbounded response buffering.**
