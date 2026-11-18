@@ -1,8 +1,8 @@
 .rocks
 .vscode
 .cargo
-.swo
-.swp
+*.swo
+*.swp
 CMakeCache.txt
 CMakeFiles
 cmake_install.cmake
@@ -24,3 +24,4 @@ node_modules
 !/tmp/.keep
 rust/target
 forecast.so
+/tmp
