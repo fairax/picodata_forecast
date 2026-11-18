@@ -17,3 +17,6 @@ tarantool = "6.1"
 
 [lib]
 crate-type = ["cdylib"]
+
+[patch.crates-io]
+fibreq = { path = "vendor/fibreq" }

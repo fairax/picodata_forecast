@@ -75,6 +75,34 @@ configuration prevents startup. Restart router processes to apply environment
 changes. Cache lookups and writes each have a one-second timeout, separate from
 the upstream request budget.
 
+### Upstream HTTP proxy
+
+To send upstream requests through an HTTP proxy, set its URL before starting routers:
+
+```bash
+export OPEN_METEO_HTTP_PROXY='http://127.0.0.1:3128'
+```
+
+Use your actual proxy address and port. Both HTTP and HTTPS upstreams are supported;
+HTTPS uses a CONNECT tunnel and still verifies the upstream certificate.
+Optional Basic authentication can be specified as
+`http://username:password@proxy-host:3128`; percent-encode special characters in
+credentials. Keep credential values outside tracked configuration files.
+
+An unset or empty value uses direct access. Standard `HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, and `NO_PROXY` variables are not consulted; the explicit setting applies
+to all forecast upstream requests. HTTPS and SOCKS proxy endpoints are unsupported.
+The proxy URL must have a host and no path (apart from `/`), query, or fragment.
+Invalid configuration prevents router initialization. Restart router processes to
+apply a change.
+
+Proxy failures do not fall back to direct access. Proxy connection/handshake
+timeouts return generic 504 responses; CONNECT rejection, proxy authentication
+failure, and malformed proxy handshakes return generic 502 responses. Temporary
+CONNECT statuses 429/502/503/504 use the existing bounded retry policy. Actual
+upstream HTTP statuses continue to be forwarded normally. Cache hits do not contact
+the proxy.
+
 ### Concurrent fetch limit
 
 Each router allows up to 32 simultaneous upstream fetches. Set

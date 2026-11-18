@@ -61,10 +61,12 @@ end
 
 local server
 local count = 0
+local proxy_authorization_seen = false
 local function publish()
     local temporary = fio.pathjoin(directory, 'state.tmp')
     local file = assert(io.open(temporary, 'w'))
-    file:write(json.encode({port = server:name().port, count = count}))
+    file:write(json.encode({port = server:name().port, count = count,
+        proxy_authorization_seen = proxy_authorization_seen}))
     file:close()
     assert(fio.rename(temporary, fio.pathjoin(directory, 'state.json')))
 end
@@ -79,7 +81,10 @@ local function handle(connection)
         assert(ssl.SSL_set_fd(session, connection:fd()) == 1)
         if tls_call(connection, session, ssl.SSL_accept) then
             local request = ffi.new('char[4096]')
-            if tls_call(connection, session, ssl.SSL_read, request, 4096) then
+            local size = tls_call(connection, session, ssl.SSL_read, request, 4096)
+            if size then
+                proxy_authorization_seen = ffi.string(request, size):lower():find('proxy-authorization', 1, true) ~= nil
+                publish()
                 tls_call(connection, session, ssl.SSL_write, ok_response, #ok_response)
             end
         end

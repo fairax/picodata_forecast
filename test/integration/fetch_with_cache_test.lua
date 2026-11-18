@@ -20,28 +20,32 @@ local function finish(future)
     return values[1]
 end
 
-local function configure(cg, endpoint, timeout, concurrency)
+local function configure(cg, endpoint, timeout, concurrency, proxy)
     timeout = timeout or '30'
+    proxy = proxy or ''
     for _, server in ipairs({cg.cluster.servers[2]}) do
         if server.env.OPEN_METEO_FORECAST_URL ~= endpoint or server.env.OPEN_METEO_TIMEOUT_SECS ~= timeout
-            or server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES ~= concurrency then
+            or server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES ~= concurrency
+            or server.env.OPEN_METEO_HTTP_PROXY ~= proxy then
             server:stop()
             server.env.OPEN_METEO_FORECAST_URL = endpoint
             server.env.OPEN_METEO_TIMEOUT_SECS = timeout
             server.env.OPEN_METEO_MAX_CONCURRENT_FETCHES = concurrency
+            server.env.OPEN_METEO_HTTP_PROXY = proxy
             server:start()
             cg.cluster:wait_until_healthy(server)
         end
     end
 end
 
-local function probe_configuration(endpoint, timeout, replica, concurrency)
+local function probe_configuration(endpoint, timeout, replica, concurrency, proxy)
     local directory = fio.tempdir()
     local output = fio.pathjoin(directory, 'result.json')
     local env = table.copy(os.environ())
     env.OPEN_METEO_FORECAST_URL = endpoint
     env.OPEN_METEO_TIMEOUT_SECS = timeout
     env.OPEN_METEO_MAX_CONCURRENT_FETCHES = concurrency
+    env.OPEN_METEO_HTTP_PROXY = proxy or ''
     local process = require('luatest.process'):start('/usr/local/bin/tarantool', {
         fio.pathjoin(helper.root, 'test', 'fixtures', 'forecast_config_probe.lua'),
         helper.root, output, directory, replica and 'replica' or 'master',
@@ -93,7 +97,7 @@ g.before_all(function(cg)
         base_http_port = 48080,
         base_advertise_port = 48300,
         use_vshard = false, -- Bootstrap after router membership has propagated.
-        env = {OPEN_METEO_FORECAST_URL = cg.endpoint, OPEN_METEO_TIMEOUT_SECS = '30'},
+        env = {OPEN_METEO_FORECAST_URL = cg.endpoint, OPEN_METEO_TIMEOUT_SECS = '30', OPEN_METEO_HTTP_PROXY = ''},
         replicasets = {{
             alias = 'storage',
             roles = {'app.roles.storage', 'vshard-storage'},
@@ -188,6 +192,7 @@ g.after_each(function(cg)
     end
     cg.gate:close()
     cg.entered:close()
+    if cg.proxy_listener then cg.proxy_listener:close(); cg.proxy_listener = nil end
     if cg.header_listener ~= nil then
         cg.header_listener:close()
         cg.header_listener = nil
@@ -1319,6 +1324,132 @@ g.test_fibreq_https_with_trusted_test_certificate = function(cg)
     t.assert_equals(response.status, 200)
     t.assert_equals(response.body, 'ok')
     t.assert_equals(fault_state(cg).count, 1)
+end
+
+-- A local-only proxy fixture; HTTPS bytes are relayed unchanged to the TLS fixture.
+local function proxy_server(cg, mode, tls_port)
+    local socket = require('socket')
+    cg.proxy_requests = {}
+    cg.proxy_listener = assert(socket.tcp_server('127.0.0.1', 0, function(connection)
+        local head = connection:read({delimiter = '\r\n\r\n'}, 5)
+        if not head then return end
+        cg.proxy_requests[#cg.proxy_requests + 1] = head
+        if mode == 'slow' then fiber.sleep(2) end
+        if mode == 'reject' then
+            connection:write('HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 6\r\n\r\nsecret', 1)
+            return
+        end
+        if mode == 'malformed' then connection:write('invalid proxy head\r\n\r\n', 1); return end
+        if mode == 'oversized' then
+            connection:write('HTTP/1.1 200 OK\r\nLong: ' .. string.rep('x', 17000) .. '\r\n\r\n', 1)
+            return
+        end
+        if head:match('^CONNECT ') then
+            local upstream = assert(socket.tcp_connect('127.0.0.1', tls_port, 3))
+            connection:write('HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 Connection Established\r\n\r\n', 3)
+            local function relay(from, to)
+                while from:readable(5) do
+                    local data = from:sysread(8192)
+                    if not data or data == '' then break end
+                    if not to:write(data, 5) then break end
+                end
+            end
+            local reader = fiber.create(function() relay(upstream, connection); connection:shutdown() end)
+            reader:set_joinable(true)
+            relay(connection, upstream)
+            upstream:shutdown()
+            reader:join()
+            upstream:close()
+        else
+            local status = mode == 'retry' and #cg.proxy_requests == 1 and 503 or 200
+            local body = mode == 'binary' and string.char(0, 255, 128) or 'proxied'
+            local headers = 'Content-Type: application/octet-stream\r\nX-Repeat: first\r\nX-Repeat: second\r\n'
+            connection:write('HTTP/1.1 ' .. status .. ' Result\r\nContent-Length: ' .. #body .. '\r\n' ..
+                headers .. 'Retry-After: 0\r\nConnection: close\r\n\r\n' .. body, 1)
+        end
+    end))
+    return 'http://127.0.0.1:' .. cg.proxy_listener:name().port
+end
+
+g.test_proxy_http_absolute_target_auth_and_cache = function(cg)
+    local proxy = proxy_server(cg, 'binary'):gsub('http://', 'http://user:p%%40ss@')
+    configure(cg, 'http://unresolvable.invalid:1234/forecast', nil, nil, proxy)
+    for _ = 1, 2 do
+        local response = fetch(cg, 'b=2&a=1').response
+        t.assert_equals(response.status, 200)
+        t.assert_equals(response.body, string.char(0, 255, 128))
+        t.assert_equals(response.headers['x-repeat'], {'first', 'second'})
+    end
+    t.assert_equals(#cg.proxy_requests, 1)
+    t.assert_str_contains(cg.proxy_requests[1], 'GET http://unresolvable.invalid:1234/forecast?a=1&b=2 HTTP/1.1')
+    t.assert_str_contains(cg.proxy_requests[1]:lower(), 'proxy-authorization: basic dxnlcjpwqhnz')
+    t.assert_equals(cg.proxy_requests[1]:lower():find('x-request-id', 1, true), nil)
+end
+
+g.test_proxy_https_connect_and_certificate_validation = function(cg)
+    fault_upstream(cg, 'certificate')
+    local port = fault_state(cg).port
+    local proxy = proxy_server(cg, 'tunnel', port):gsub('http://', 'http://user:p%%40ss@')
+    local endpoint = 'https://localhost:' .. port .. '/forecast'
+    configure(cg, endpoint, nil, nil, proxy)
+    t.assert_equals(fetch(cg, 'proxy=untrusted').response.status, 502)
+    t.assert_equals(#cg.proxy_requests, 1) -- Certificate failures are not retried.
+    cg.cluster.servers[2].env.SSL_CERT_FILE = fio.pathjoin(cg.fault_directory, 'cert.pem')
+    configure(cg, endpoint, '29', nil, proxy) -- Restart with the trusted test certificate.
+    local response = fetch(cg, 'proxy=trusted').response
+    t.assert_equals(response.status, 200)
+    t.assert_equals(response.body, 'ok')
+    t.assert_str_contains(cg.proxy_requests[2], 'CONNECT localhost:' .. port .. ' HTTP/1.1')
+    t.assert_str_contains(cg.proxy_requests[2]:lower(), 'proxy-authorization: basic dxnlcjpwqhnz')
+    t.assert_equals(fault_state(cg).proxy_authorization_seen, false)
+end
+
+g.test_proxy_rejection_is_generic_without_direct_fallback = function(cg)
+    local proxy = proxy_server(cg, 'reject')
+    configure(cg, cg.endpoint, nil, nil, proxy)
+    for _ = 1, 2 do
+        local response = fetch(cg, 'proxy=rejected').response
+        t.assert_equals(response.status, 502)
+        t.assert_equals(response.body, 'Forecast service unavailable')
+    end
+    t.assert_equals(#cg.proxy_requests, 2)
+    t.assert_equals(cg.requests, 0)
+end
+
+g.test_proxy_timeout_yields_and_retries_transient_responses = function(cg)
+    local proxy = proxy_server(cg, 'slow')
+    configure(cg, cg.endpoint, '1', nil, proxy)
+    local future = fetch(cg, 'proxy=timeout', true)
+    t.helpers.retrying({timeout = 3}, function() t.assert_equals(#cg.proxy_requests, 1) end)
+    t.assert_equals(cg.cluster.servers[2].net_box:eval('return 42', {}, {timeout = 0.5}), 42)
+    t.assert_equals(finish(future).response.status, 504)
+    t.assert_equals(#cg.proxy_requests, 1)
+    cg.proxy_listener:close()
+    proxy = proxy_server(cg, 'retry')
+    configure(cg, cg.endpoint, nil, nil, proxy)
+    for _ = 1, 2 do t.assert_equals(fetch(cg, 'proxy=retry').response.status, 200) end
+    t.assert_equals(#cg.proxy_requests, 2) -- Retry then success; subsequent call hits cache.
+end
+
+g.test_proxy_connect_malformed_and_large_heads = function(cg)
+    for _, mode in ipairs({'malformed', 'oversized'}) do
+        local proxy = proxy_server(cg, mode)
+        configure(cg, 'https://unresolvable.invalid/forecast', nil, nil, proxy)
+        t.assert_equals(fetch(cg, 'proxy=' .. mode).response.status, 502)
+        t.assert_equals(#cg.proxy_requests, 1)
+        cg.proxy_listener:close()
+        cg.proxy_listener = nil
+    end
+end
+
+g.test_proxy_invalid_configuration_fails_without_exposing_credentials = function()
+    for _, value in ipairs({'invalid', 'https://proxy:443', 'socks5://proxy:1080',
+        'http://user:secret@proxy/path', 'http://proxy?q=1', 'http://proxy#fragment', string.char(255)}) do
+        local result = probe_configuration('http://localhost/forecast', '30', false, nil, value)
+        t.assert_equals(result.ok, false)
+        t.assert_str_contains(result.error, 'OPEN_METEO_HTTP_PROXY')
+        t.assert_equals(result.error:find('secret', 1, true), nil)
+    end
 end
 
 local function request_with_id(cg, query, request_id)

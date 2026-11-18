@@ -111,6 +111,7 @@ impl Deref for NormalizedQuery {
 struct ForecastConfig {
     endpoint: url::Url,
     timeout: Duration,
+    proxy: Option<fibreq::Proxy>,
 }
 
 static CONFIG: OnceLock<ForecastConfig> = OnceLock::new();
@@ -131,11 +132,23 @@ pub fn initialize() -> std::result::Result<(), FetchError> {
         ));
     }
     let timeout = fetch_timeout()?;
+    let proxy = match std::env::var("OPEN_METEO_HTTP_PROXY") {
+        Ok(value) if value.is_empty() => None,
+        Ok(value) => Some(fibreq::Proxy::http(&value).map_err(|_| FetchError::internal(
+            "OPEN_METEO_HTTP_PROXY must be an HTTP proxy URL with a host and no path, query or fragment"
+        ))?),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => return Err(FetchError::internal("OPEN_METEO_HTTP_PROXY must contain valid Unicode")),
+    };
     Instant::now().checked_add(timeout).ok_or_else(|| {
         FetchError::internal("OPEN_METEO_TIMEOUT_SECS exceeds the supported deadline range")
     })?;
     CONFIG
-        .set(ForecastConfig { endpoint, timeout })
+        .set(ForecastConfig {
+            endpoint,
+            timeout,
+            proxy,
+        })
         .map_err(|_| FetchError::internal("Forecast configuration is already initialized"))
 }
 
@@ -331,7 +344,12 @@ impl AttemptError {
                     }) => retryable_io(error),
                     _ => temporary_cause(error.as_ref()),
                 };
-                let retryable = timeout || matches!(*error, Error::SocketClosed) || temporary;
+                let retryable = timeout
+                    || matches!(
+                        *error,
+                        Error::SocketClosed | Error::ProxyStatus(429 | 502 | 503 | 504)
+                    )
+                    || temporary;
                 let detail = error.to_string();
                 ClassifiedFailure {
                     error: if timeout {
@@ -384,11 +402,14 @@ fn fetch_once(
     let timeout = remaining.min(Duration::from_secs(10));
     // A private client per exchange avoids reusing a socket before its body
     // is consumed, and avoids repeated TLS handshakes on a pooled TLS socket.
-    let client = fibreq::ClientBuilder::new()
+    let mut client = fibreq::ClientBuilder::new()
         .pool_max_conns(1)
         .pool_connect_timeout(timeout)
-        .pool_acquire_timeout(timeout)
-        .build();
+        .pool_acquire_timeout(timeout);
+    if let Some(proxy) = CONFIG.get().and_then(|config| config.proxy.clone()) {
+        client = client.proxy(proxy);
+    }
+    let client = client.build();
     let mut response = client
         .get(url.as_str())?
         .tls_timeout(timeout)
