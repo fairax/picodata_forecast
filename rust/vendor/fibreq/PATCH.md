@@ -27,4 +27,4 @@ Changes:
 
 Only `src/proxy.rs`, `src/client.rs`, `src/error.rs`, `src/lib.rs`, and `Cargo.toml`
 differ from the published source. Proxy integration tests live in
-`test/integration/fetch_with_cache_test.lua`; run with `-p test_proxy`.
+`test/integration/proxy_test.lua`.

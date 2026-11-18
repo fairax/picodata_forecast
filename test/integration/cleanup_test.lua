@@ -314,9 +314,15 @@ g.test_backlog_yields_and_drains_in_background = function(cg)
         local fiber = require('fiber')
         local space = box.space.forecast_cache
         for i = 1, 350 do space:replace({tostring(i), 1, 200, binary('old'), {type = {'text'}}, 0, 0}) end
-        local ticks = 0
+        local intermediate = false
         local running = true
-        local heartbeat = fiber.new(function() while running do ticks = ticks + 1; fiber.sleep(0) end end)
+        local heartbeat = fiber.new(function()
+            while running do
+                local remaining = space:count()
+                if remaining > 0 and remaining < 350 then intermediate = true end
+                fiber.sleep(0)
+            end
+        end)
         heartbeat:set_joinable(true)
         role.apply_config(nil, {is_master = true})
         local deadline = fiber.clock() + 5
@@ -324,10 +330,10 @@ g.test_backlog_yields_and_drains_in_background = function(cg)
         role.stop()
         running = false
         heartbeat:join()
-        return {count = space:count(), ticks = ticks}
+        return {count = space:count(), intermediate = intermediate}
     ]])
     t.assert_equals(result.count, 0)
-    t.assert(result.ticks > 1)
+    t.assert_equals(result.intermediate, true)
 end
 
 g.test_eviction_batches_and_lru_order = function(cg)
@@ -447,8 +453,14 @@ g.test_eviction_hysteresis_and_fiber_progress = function(cg)
             if phase == 3 then used = math.floor(box.cfg.memtx_memory * 0.75) end
             return {data = used, index = 0}
         end
-        local ticks, running = 0, true
-        local heartbeat = fiber.new(function() while running do ticks = ticks + 1; fiber.sleep(0) end end)
+        local intermediate, running = false, true
+        local heartbeat = fiber.new(function()
+            while running do
+                local remaining = space:count()
+                if phase == 2 and remaining > 50 and remaining < 200 then intermediate = true end
+                fiber.sleep(0)
+            end
+        end)
         heartbeat:set_joinable(true)
         role.apply_config(nil, {is_master = true})
         fiber.sleep(0.05)
@@ -462,13 +474,14 @@ g.test_eviction_hysteresis_and_fiber_progress = function(cg)
         role.stop()
         running = false
         heartbeat:join()
-        return {below_high = below_high, at_low = at_low, after = space:count(), ticks = ticks, middle = middle}
+        return {below_high = below_high, at_low = at_low, after = space:count(),
+            intermediate = intermediate, middle = middle}
     ]])
     t.assert_equals(result.below_high, 200)
     t.assert_equals(result.at_low, 50)
     t.assert_equals(result.after, 50)
     t.assert_equals(result.middle, true)
-    t.assert(result.ticks > 1)
+    t.assert_equals(result.intermediate, true)
 end
 
 g.test_unreclaimable_eviction_sleeps_and_recovers = function(cg)

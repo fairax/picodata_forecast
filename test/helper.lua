@@ -3,31 +3,13 @@
 
 local fio = require('fio')
 local t = require('luatest')
-local cartridge_helpers = require('cartridge.test-helpers')
 
 local helper = {}
 
 helper.root = fio.dirname(fio.abspath(package.search('init')))
-helper.datadir = fio.pathjoin(helper.root, 'tmp', 'db_test')
+package.path = helper.root .. '/?.lua;' .. helper.root .. '/?/init.lua;' .. package.path
+helper.datadir = assert(fio.tempdir())
 helper.server_command = fio.pathjoin(helper.root, 'init.lua')
-
-helper.cluster = cartridge_helpers.Cluster:new({
-    server_command = helper.server_command,
-    datadir = fio.pathjoin(helper.datadir, 'api'),
-    base_http_port = 28080,
-    base_advertise_port = 28300,
-    use_vshard = false,
-    replicasets = {
-        {
-            alias = 'api',
-            uuid = cartridge_helpers.uuid('a'),
-            roles = {'app.roles.custom'},
-            servers = {
-                { instance_uuid = cartridge_helpers.uuid('a', 1), alias = 'api' },
-            },
-        },
-    }
-})
 
 function helper.truncate_space_on_cluster(cluster, space_name)
     assert(cluster ~= nil)
@@ -62,9 +44,12 @@ function helper.stop_cluster(cluster)
 end
 
 t.before_suite(function()
-    fio.rmtree(helper.datadir)
-    fio.mktree(helper.datadir)
     box.cfg({work_dir = helper.datadir})
+end)
+
+t.after_suite(function()
+    fio.chdir(helper.root)
+    fio.rmtree(helper.datadir)
 end)
 
 return helper

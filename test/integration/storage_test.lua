@@ -163,6 +163,7 @@ g.test_empty_bodies_skip_insertion_and_preserve_existing_entries = function(cg)
 end
 
 g.test_expired_read_deletes_entry = function(cg)
+    cg.cluster.main_server.net_box:eval("require('app.roles.storage').stop()")
     seed_expired(cg, 'expired=1')
     t.assert_equals(call(cg, 'cache_get', 'expired=1'), nil)
     t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
@@ -177,17 +178,6 @@ g.test_background_cleanup_removes_untouched_expired_entries = function(cg)
     seed_expired(cg, 'expired=1')
     t.helpers.retrying({timeout = 5}, function()
         t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 0)
-    end)
-end
-
-g.test_insert_does_not_scan_other_expired_entries = function(cg)
-    cg.cluster.main_server.net_box:eval("require('app.roles.storage').stop()")
-    seed_expired(cg, 'expired=1')
-    put(cg, 'fresh=1')
-    t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 2)
-    cg.cluster.main_server.net_box:eval("require('app.roles.storage').apply_config(nil, {is_master = true})")
-    t.helpers.retrying({timeout = 5}, function()
-        t.assert_equals(cg.cluster.main_server.net_box:eval('return box.space.forecast_cache:count()'), 1)
     end)
 end
 

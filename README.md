@@ -206,7 +206,6 @@ Then, run linter:
 Now we can run tests:
 
 ```bash
-cartridge stop  # to prevent "address already in use" error
 .rocks/bin/luatest -v
 ```
 
@@ -220,11 +219,12 @@ To test the Rust storage integration, build the shared library and run:
 To run the forecast routing and cache integration tests:
 
 ```bash
-.rocks/bin/luatest -v test/integration/fetch_with_cache_test.lua
+.rocks/bin/luatest -v test/integration/router_test.lua
 ```
 
 Building requires a C compiler, Make, and Perl. Transport tests require `openssl`
-on `PATH`.
+on `PATH`. Tests use separate instance ports and temporary data directories.
+See [test suites](test/README.md) for focused commands and coverage.
 
 ## Admin
 
