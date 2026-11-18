@@ -1,10 +1,10 @@
-# Simple Tarantool Cartridge-based application
+# Open-Meteo caching proxy
 
 A sharded caching proxy for Open-Meteo, built on Tarantool Cartridge.
 
 ## Quick start
 
-To build the application and set up the topology:
+For a new local cluster:
 
 ```bash
 cartridge build
@@ -12,10 +12,9 @@ cartridge start -d
 cartridge replicasets setup --bootstrap-vshard
 ```
 
-Now you can visit http://localhost:8081 and see your application's Admin Web UI.
+Open http://localhost:8081 for the Cartridge admin UI.
 
-**Note**, that application stateboard is always started by default.
-See [`.cartridge.yml`](./.cartridge.yml) file to change this behavior.
+The stateboard starts by default; see [`.cartridge.yml`](./.cartridge.yml).
 
 ## Usage
 
@@ -26,54 +25,41 @@ curl 'localhost:8081/forecast?latitude=56&longitude=60&current=temperature_2m'
 curl localhost:8081/metrics
 ```
 
-Routers fetch forecasts from Open-Meteo and cache successful responses for 60 seconds.
-Cache hits avoid upstream requests.
+Successful (200–299), nonempty responses are cached for 60 seconds. Cache hits
+include `X-Cache: HIT` and avoid upstream requests. Cache failures are logged;
+requests can still succeed by fetching upstream. Expired responses are never served.
 
-Upstream HTTP responses retain their status, body, and relevant headers, including
-`Content-Type` and `Retry-After`. Only successful (200–299) responses with nonempty
-bodies are cached. Empty responses are returned unchanged.
-Bodies are preserved byte-for-byte, including non-UTF-8 and compressed data.
-Upstream timeouts return a generic 504 response, connection/TLS failures return 502,
-and internal application failures return 500. Detailed internal errors
-are logged on the server. If storage is unavailable, the router fetches from
-upstream and returns the response without requiring a successful cache write.
+Upstream status, response bytes, and relevant headers are preserved. Redirects are
+returned without being followed. Temporary failures and HTTP 429/502/503/504 may
+be retried, with at most three attempts and respect for `Retry-After` within the
+configured budget. Certificate validation failures are not retried.
 
-Caching is best-effort: cache failures are logged, valid upstream responses are
-still returned, and expired responses are never served. Cache failures can increase
-upstream traffic.
+Upstream timeouts return 504, connection/TLS failures return 502, and internal
+application failures return 500. Error details are kept in server logs.
 
-Forecast fetching retries temporary transport failures and HTTP 429, 502, 503, and
-504, with at most three attempts. Retries respect `Retry-After` when the delay
-fits within the configured budget. Certificate validation failures and other HTTP
-errors are not retried. Redirect responses are returned to the client without being followed.
-
-Expired entries are removed automatically. Under memory
-pressure, least recently used entries may be evicted, including unexpired entries.
-Eviction starts at 80% of the instance's configured memtx memory and targets 70%,
-based on estimated live data usage. These thresholds do not cap process RAM
-or guarantee that writes cannot run out of memory.
-
-Cache contents are held only in memory and are not persisted or replicated.
-Restarts and replica promotion can produce cold caches. Cluster metadata remains
-persistent.
+The cache is memory-only. Entries may be evicted under memory pressure and are
+lost on restart or replica promotion. Cluster metadata remains persistent.
 
 ### Upstream configuration
 
-`OPEN_METEO_TIMEOUT_SECS` sets the retry budget in positive integer seconds
-(default 30). Requests can exceed this budget because connection and response
-timeouts apply separately; it is not a strict end-to-end deadline.
+Set environment variables before starting routers:
 
-For example, set the budget before starting router instances:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `OPEN_METEO_FORECAST_URL` | `https://api.open-meteo.com/v1/forecast` | Upstream HTTP or HTTPS endpoint |
+| `OPEN_METEO_TIMEOUT_SECS` | `30` | Retry budget in positive integer seconds |
+| `OPEN_METEO_HTTP_PROXY` | Unset (direct access) | Optional HTTP proxy; see below |
+| `OPEN_METEO_MAX_CONCURRENT_FETCHES` | `32` | Concurrent upstream fetch limit per router (positive integer) |
+
+For example:
 
 ```bash
 export OPEN_METEO_TIMEOUT_SECS=15
 ```
 
-`OPEN_METEO_FORECAST_URL` (default `https://api.open-meteo.com/v1/forecast`) and
-`OPEN_METEO_TIMEOUT_SECS` are validated when the router role starts. Invalid
-configuration prevents startup. Restart router processes to apply environment
-changes. Cache lookups and writes each have a one-second timeout, separate from
-the upstream request budget.
+Invalid configuration prevents router startup. Restart router processes to apply
+changes. The retry budget is not a strict end-to-end deadline; requests can take
+longer, and cache operations have separate timeouts.
 
 ### Upstream HTTP proxy
 
@@ -83,9 +69,8 @@ To send upstream requests through an HTTP proxy, set its URL before starting rou
 export OPEN_METEO_HTTP_PROXY='http://127.0.0.1:3128'
 ```
 
-Use your actual proxy address and port. Both HTTP and HTTPS upstreams are supported;
-HTTPS uses a CONNECT tunnel and still verifies the upstream certificate.
-Optional Basic authentication can be specified as
+Use your actual proxy address and port. HTTP and HTTPS upstreams are supported,
+and upstream certificates are still verified. Optional Basic authentication uses
 `http://username:password@proxy-host:3128`; percent-encode special characters in
 credentials. Keep credential values outside tracked configuration files.
 
@@ -93,60 +78,24 @@ An unset or empty value uses direct access. Standard `HTTP_PROXY`, `HTTPS_PROXY`
 `ALL_PROXY`, and `NO_PROXY` variables are not consulted; the explicit setting applies
 to all forecast upstream requests. HTTPS and SOCKS proxy endpoints are unsupported.
 The proxy URL must have a host and no path (apart from `/`), query, or fragment.
-Invalid configuration prevents router initialization. Restart router processes to
-apply a change.
-
-Proxy failures do not fall back to direct access. Proxy connection/handshake
-timeouts return generic 504 responses; CONNECT rejection, proxy authentication
-failure, and malformed proxy handshakes return generic 502 responses. Temporary
-CONNECT statuses 429/502/503/504 use the existing bounded retry policy. Actual
-upstream HTTP statuses continue to be forwarded normally. Cache hits do not contact
-the proxy.
+Proxy failures do not fall back to direct access. Proxy timeouts return 504;
+authentication and protocol failures return 502. Cache hits do not contact the proxy.
 
 ### Concurrent fetch limit
 
-Each router allows up to 32 simultaneous upstream fetches. Set
-`OPEN_METEO_MAX_CONCURRENT_FETCHES` to a positive integer before starting routers
-to change the limit; restart routers after changes. Cache hits remain available
-when the limit is reached. Additional cache misses immediately return 503
-(`Forecast service busy`), without queuing or contacting upstream.
-
-A fetch occupies a slot through retries and cache insertion. Disconnecting a client
-does not stop its ongoing fetch or immediately free its slot. The limit applies
-independently to each router and does not cap total memory usage.
+When a router reaches its concurrent fetch limit, additional cache misses return
+503 (`Forecast service busy`); cache hits remain available. Disconnecting a client
+does not necessarily stop its fetch. This limit does not cap total memory usage.
 
 ### Request tracing and metrics
 
-Every `/forecast` response includes `X-Request-ID`. Valid incoming IDs are reused;
-otherwise a UUID is generated. IDs must contain 1–128 ASCII letters, digits,
-periods, underscores, colons, or hyphens. Repeated or invalid IDs are replaced.
-The same ID identifies related router and storage logs, including upstream attempts
-and retries. It is not sent to the upstream service. Cache hits return the current
-request's ID, never a cached ID.
+Every `/forecast` response includes `X-Request-ID`. Use it to find related router
+and storage logs. Valid incoming IDs are reused; otherwise an ID is generated.
+IDs are not sent upstream. Logs omit response bodies and full query strings.
 
-Structured log events include the request ID, instance UUID, duration, and relevant
-status, bucket, attempt, and error classification. Completion summaries are logged
-at info, stage details at debug, and failures at warning/error. Existing log output
-settings are retained. Bodies and full queries are not included in request events.
-
-The `/metrics` endpoint exports HTTP request counts and latency as
-`http_server_request_latency_count`, `_sum`, and `_bucket`, plus:
-
-| Metric | Meaning |
-| --- | --- |
-| `forecast_cache_operations_total` | Cache operations by operation and outcome |
-| `forecast_upstream_attempts_total` | Upstream attempts by outcome and status |
-| `forecast_upstream_attempt_duration_seconds` | Upstream attempt duration histogram |
-| `forecast_upstream_retries_total` | Retries actually started, by reason |
-| `forecast_active_fetches` | Fetches still occupying a concurrency slot |
-| `forecast_rejected_requests_total` | Requests rejected by the concurrency limit |
-
-Request IDs, queries, and bucket IDs are excluded from metric labels. Observations
-use `status="cancelled"` when a handler is cancelled without a response. Histogram
-boundaries range from 1 ms to 120 seconds, with an overflow bucket. Request tracing
-does not change retry or caching behavior; disconnected callers' fetches can
-continue and retain their request IDs until completion. Deploy and restart routers
-and storage instances together to load these changes.
+The `/metrics` endpoint exposes request counts, latency, cache outcomes, upstream
+attempts and retries, active fetches, and rejections. See the
+[monitoring reference](monitoring/README.md) for metric names and request-ID rules.
 
 ### Grafana and Prometheus
 
@@ -230,9 +179,8 @@ for matching queries.
 
 ## Instances configuration
 
-Configuration of instances that can be used to start application
-locally is stored in [instances.yml](./instances.yml).
-It is used by `cartridge start`.
+Local instance configuration is stored in [instances.yml](./instances.yml) and
+used by `cartridge start`.
 
 ## Topology configuration
 
@@ -241,7 +189,7 @@ It is used by `cartridge replicasets setup`.
 
 ## Tests
 
-Simple unit and integration tests are placed in [`test`](./test) directory.
+Unit and integration tests are in [`test`](./test).
 
 First, we need to install test dependencies:
 
@@ -276,7 +224,7 @@ To run the forecast routing and cache integration tests:
 ```
 
 Building requires a C compiler, Make, and Perl. Transport tests require `openssl`
-on `PATH`. The slow-upstream timeout test exercises the default 30-second retry budget.
+on `PATH`.
 
 ## Admin
 

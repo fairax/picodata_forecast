@@ -2,9 +2,33 @@
 
 See the main README for startup, login, target configuration, and data removal.
 
-The local stack pins Prometheus 3.16.0 and Grafana 13.3.1. Configuration and dashboard
-definitions are mounted read-only; metrics and Grafana settings use named volumes.
-The provisioned Prometheus data source has UID `open-meteo-prometheus`.
+The local stack uses Prometheus 3.16.0 and Grafana 13.3.1. Stored metrics and
+Grafana settings survive monitoring restarts.
+
+## Request IDs and metric reference
+
+Every forecast response includes `X-Request-ID`, including cache hits. Incoming
+IDs must contain 1–128 ASCII letters, digits, periods, underscores, colons, or
+hyphens. Invalid or repeated IDs are replaced with a generated UUID.
+Use the ID to correlate router and storage logs; it is not sent upstream.
+
+Request completion summaries are logged at info, stage details at debug, and
+failures at warning/error. Request events omit response bodies and full queries.
+
+| Metric | Meaning |
+| --- | --- |
+| `http_server_request_latency_count`, `_sum`, `_bucket` | HTTP request counts and latency |
+| `forecast_cache_operations_total` | Cache operations by operation and outcome |
+| `forecast_upstream_attempts_total` | Upstream attempts by outcome and status |
+| `forecast_upstream_attempt_duration_seconds` | Upstream attempt duration |
+| `forecast_upstream_retries_total` | Retries started, by reason |
+| `forecast_active_fetches` | Fetches occupying a concurrency slot |
+| `forecast_rejected_requests_total` | Requests rejected by the concurrency limit |
+
+HTTP metrics use `status="cancelled"` for cancellations without a response.
+Request IDs, query strings, and bucket IDs are not metric labels. Disconnected
+clients can leave a fetch running, so active fetch counts can remain elevated
+until those fetches finish.
 
 ## Dashboard attribution
 
@@ -16,15 +40,12 @@ Grafana dashboard 13054, revision 22:
 - Copyright (c) 2020–2021 Tarantool, MIT license; see
   `grafana/dashboards/TARANTOOL-LICENSE`.
 
-Local adaptations set a stable dashboard UID, clear the database ID, disable direct
-editing, and select the provisioned Prometheus data source in the datasource
-variable. Queries and panels are retained from upstream. Grafana automatically
-migrates legacy graph panels when opening the dashboard.
+The dashboard is configured to use this stack's Prometheus data source. Its
+queries and panels are retained from upstream.
 
-`grafana/dashboards/forecast.json` is the application dashboard. It selects only the
-`open-meteo` scrape job, uses Grafana's rate interval, and aggregates histogram
-buckets before calculating p95. The instance selector includes all five configured
-targets; request metrics are emitted on routers.
+`grafana/dashboards/forecast.json` is the application dashboard. Its instance
+selector includes all five configured targets; request metrics are emitted on
+routers. The cache hit ratio excludes lookup errors.
 
 ## Configuration checks
 
@@ -32,12 +53,11 @@ targets; request metrics are emitted on routers.
 docker compose -f compose.monitoring.yml config --quiet
 docker compose -f compose.monitoring.yml run --rm --no-deps \
   --entrypoint promtool prometheus check config /etc/prometheus/prometheus.yml
-python3 monitoring/test_alerts.py
+tarantool monitoring/test_alerts.lua
 ```
 
-The alert tests use Python 3.9+ (standard library only) and Docker. They extract
-the exact provisioned queries, thresholds, and pending durations and test them
-with the pinned Prometheus image; there is no duplicate set of production rules.
+The alert tests require Tarantool and Docker. They check thresholds, pending
+durations, low traffic, missing metrics, and recovery.
 
 ## Alerts
 
