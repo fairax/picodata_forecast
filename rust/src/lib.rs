@@ -6,22 +6,32 @@ mod storage;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Validate and save forecast environment settings during router role initialization.
+/// Repeated calls preserve the existing configuration; invalid settings fail startup.
 #[proc]
 fn init_forecast() -> Result<()> {
     forecast::initialize()
         .map_err(|error| format!("Invalid forecast configuration: {error:?}").into())
 }
 
+/// Create the in-memory forecast cache space and its indexes if absent.
+/// Called during storage master initialization; existing cache contents are preserved.
 #[proc]
 fn create_schema() -> tarantool::Result<()> {
     storage::create_schema()
 }
 
+/// Scan at most 100 expired cache entries without yielding, deleting available ones.
+/// Resume after an optional `(expires_at, key)` cursor and return counts plus continuation.
+/// The background driver yields between batches and resets the cursor after a sweep.
 #[proc]
 fn cleanup_expired(cursor: Option<storage::CleanupCursor>) -> Result<storage::CleanupBatch> {
     storage::cleanup_expired(cursor)
 }
 
+/// Evict oldest-accessed cache entries until live memtx usage reaches `target_bytes`.
+/// Scan at most 100 entries without yielding, skipping unavailable buckets.
+/// Return counts and continuation using an independent `(last_access, key)` cursor.
 #[proc]
 fn evict_cache(
     cursor: Option<storage::CleanupCursor>,
@@ -30,11 +40,16 @@ fn evict_cache(
     storage::evict_cache(cursor, target_bytes)
 }
 
+/// Canonicalize query encoding and stably sort parameters by name.
+/// Repeated parameters retain their value order so equivalent queries share a cache key.
 #[proc]
 fn normalize_query(query: &str) -> String {
     forecast::NormalizedQuery::new(query).to_string()
 }
 
+/// Fetch a normalized forecast query with retries, yielding during HTTP I/O and backoff.
+/// Bypass the cache and preserve upstream statuses, body bytes and repeated headers.
+/// Log failures with `request_id` and return generic HTTP error responses.
 #[proc]
 fn fetch_forecast(query: &str, request_id: &str) -> Result<forecast::Response> {
     let normalized_query = forecast::NormalizedQuery::new(query);
@@ -57,6 +72,9 @@ fn fetch_forecast(query: &str, request_id: &str) -> Result<forecast::Response> {
     )
 }
 
+/// Look up a normalized query and return a fresh cached response with `X-Cache: HIT`.
+/// Expired entries are misses; deletion and access-time update failures are logged.
+/// Report lookup/decoding errors to the caller and record the outcome with `request_id`.
 #[proc]
 fn cache_get(query: &str, request_id: &str) -> Result<Option<forecast::Response>> {
     let started = std::time::Instant::now();
@@ -86,6 +104,9 @@ fn cache_get(query: &str, request_id: &str) -> Result<Option<forecast::Response>
     result
 }
 
+/// Cache a nonempty 2xx response for 60 seconds under its normalized query and bucket.
+/// Strip response request IDs; other responses are skipped. Return true on success or skip.
+/// Log the outcome with `request_id` and propagate insertion errors to the caller.
 #[proc]
 fn cache_put(
     query: &str,
