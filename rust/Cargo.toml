@@ -1,0 +1,22 @@
+[package]
+name = "forecast"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fastrand = "2"
+form_urlencoded = "1"
+httpdate = "1"
+fibreq = "=0.2.0"
+# Isolate TLS from the different OpenSSL version embedded in Tarantool.
+native-tls = { version = "0.2", features = ["vendored"] }
+url = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+tarantool = "6.1"
+
+[lib]
+crate-type = ["cdylib"]
+
+[patch.crates-io]
+fibreq = { path = "vendor/fibreq" }
