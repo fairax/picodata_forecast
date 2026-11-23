@@ -1,15 +1,10 @@
-local cartridge = require('cartridge')
-
 local function init(opts) -- luacheck: no unused args
-    -- if opts.is_master then
-    -- end
-
-    local httpd = assert(cartridge.service_get('httpd'), "Failed to get httpd service")
-    httpd:route({method = 'GET', path = '/forecast'}, function()
-        return {body = 'Hello world!'}
-    end)
-
-    return true
+    if not opts.is_master then
+        return true
+    end
+    local name = 'forecast.router_init'
+    box.schema.func.create(name, {language = 'C', if_not_exists = true})
+    return box.func[name]:call()
 end
 
 local function stop()

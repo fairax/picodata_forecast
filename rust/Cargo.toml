@@ -9,4 +9,5 @@ crate-type = ["cdylib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
+shors = "=0.12.3"
 tarantool = "6.1.0"
