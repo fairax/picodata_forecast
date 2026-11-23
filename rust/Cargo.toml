@@ -7,4 +7,6 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 tarantool = "6.1.0"
