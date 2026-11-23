@@ -2,6 +2,7 @@
 *.swo
 *.swp
 .vscode
+.cargo
 CMakeCache.txt
 CMakeFiles
 cmake_install.cmake
