@@ -7,6 +7,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
+fibreq = "=0.2.0"
+native-tls = { version = "0.2", features = ["vendored"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 shors = "=0.12.3"

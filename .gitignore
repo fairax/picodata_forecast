@@ -24,3 +24,4 @@ node_modules
 !/tmp/.keep
 /rust/target
 forecast.so
+/proxy/
