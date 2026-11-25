@@ -1,14 +1,18 @@
+use super::storage::{CACHE_GET_ROUTE, CACHE_PUT_ROUTE};
+use serde_bytes::{ByteBuf, Bytes};
 use shors::transport::http::{route::Builder, server::Server, Request, Response};
+use shors::transport::rpc::client;
 use shors::transport::Context;
 use std::cell::RefCell;
 use std::error::Error;
 use std::time::Duration;
 use tarantool::error::{BoxError, TarantoolErrorCode};
+use tarantool::tlua::{AsLua, StaticLua};
 use tarantool::tuple::Tuple;
 use url::Url;
 
-const OPEN_METEO_FORECAST_URL: &str = "https://api.open-meteo.com/v1/forecast";
-const OPEN_METEO_TIMEOUT: Duration = Duration::from_secs(10);
+const OPEN_METEO_FORECAST_URL_DEFAULT: &str = "https://api.open-meteo.com/v1/forecast";
+const OPEN_METEO_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 
 struct ForecastConfig {
     upstream_url: Url,
@@ -19,8 +23,8 @@ thread_local! {
     // Holding a config borrow across a yield can cause overlapping conflicting
     // borrows if another fiber applies configuration.
     static FORECAST_CONFIG: RefCell<ForecastConfig> = RefCell::new(ForecastConfig {
-        upstream_url: Url::parse(OPEN_METEO_FORECAST_URL).expect("valid default Open-Meteo URL"),
-        upstream_timeout: OPEN_METEO_TIMEOUT,
+        upstream_url: Url::parse(OPEN_METEO_FORECAST_URL_DEFAULT).expect("valid default Open-Meteo URL"),
+        upstream_timeout: OPEN_METEO_TIMEOUT_DEFAULT,
     });
 }
 
@@ -41,6 +45,10 @@ fn router_apply_config(settings: Option<ForecastSettings>) -> tarantool::Result<
 
 #[tarantool::proc]
 pub fn router_init() -> tarantool::Result<bool> {
+    let lua = tarantool::lua_state();
+    let lua_view = unsafe { StaticLua::from_static(lua.as_lua()) };
+    shors::init_lua_functions(&lua_view)?;
+
     let route = Builder::new()
         .with_method("GET")
         .with_path("/forecast")
@@ -54,31 +62,86 @@ pub fn router_init() -> tarantool::Result<bool> {
 }
 
 fn fetch_forecast(query: &str) -> Response {
+    let bucket_id = cache_bucket_id(query);
+    if let Some(body) = bucket_id.and_then(|bucket_id| read_cache(bucket_id, query)) {
+        return forecast_response(200, body.into_vec());
+    }
+
     let (mut url, timeout) = FORECAST_CONFIG.with(|config| {
         let config = config.borrow();
         (config.upstream_url.clone(), config.upstream_timeout)
     });
     url.set_query((!query.is_empty()).then_some(query));
+
     let client = fibreq::ClientBuilder::new().build();
     let result = client.get(url.as_str()).and_then(|request| {
-        request
+        let mut upstream = request
             .tls_timeout(timeout)
             .request_timeout(timeout)
             .response_timeout(timeout)
-            .send()?
-            .bytes()
+            .send()?;
+        let status = upstream.status();
+        if status.is_server_error() {
+            return Ok(gateway_error(502, "Open-Meteo request failed"));
+        }
+
+        let body = upstream.bytes()?;
+        if status.is_success() {
+            if let Some(bucket_id) = bucket_id {
+                write_cache(bucket_id, query, &body);
+            }
+        }
+        let response_status = if status.is_client_error() {
+            u32::from(u16::from(status))
+        } else {
+            200
+        };
+        Ok(forecast_response(response_status, body))
     });
 
     match result {
-        Ok(body) => Response {
-            status: 200,
-            headers: Default::default(),
-            body,
-        },
+        Ok(response) => response,
         Err(err) if matches!(*err, fibreq::Error::Timeout) => {
             gateway_error(504, "Open-Meteo request timed out")
         }
         _ => gateway_error(502, "Open-Meteo request failed"),
+    }
+}
+
+fn cache_bucket_id(key: &str) -> Option<i64> {
+    tarantool::lua_state()
+        .eval_with(
+            "return require('vshard').router.bucket_id_strcrc32(...)",
+            key,
+        )
+        .ok()
+}
+
+fn read_cache(bucket_id: i64, key: &str) -> Option<ByteBuf> {
+    let lua = tarantool::lua_state();
+    let response = client::Builder::new(&lua)
+        .shard_endpoint(CACHE_GET_ROUTE)
+        .call(&mut Context::background(), bucket_id, key)
+        .ok()?;
+    response.decode::<(Option<ByteBuf>,)>().ok()?.0
+}
+
+fn write_cache(bucket_id: i64, key: &str, body: &[u8]) {
+    let lua = tarantool::lua_state();
+    let _ = client::Builder::new(&lua)
+        .shard_endpoint(CACHE_PUT_ROUTE)
+        .call(
+            &mut Context::background(),
+            bucket_id,
+            (key, bucket_id, Bytes::new(body)),
+        );
+}
+
+fn forecast_response(status: u32, body: Vec<u8>) -> Response {
+    Response {
+        status,
+        headers: Default::default(),
+        body,
     }
 }
 
@@ -106,7 +169,7 @@ impl ForecastSettings {
     }
 
     fn parse_upstream_url(upstream_url: Option<&str>) -> tarantool::Result<Url> {
-        Url::parse(upstream_url.unwrap_or(OPEN_METEO_FORECAST_URL))
+        Url::parse(upstream_url.unwrap_or(OPEN_METEO_FORECAST_URL_DEFAULT))
             .ok()
             .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
             .ok_or_else(|| {
@@ -120,7 +183,7 @@ impl ForecastSettings {
 
     fn parse_upstream_timeout(timeout_seconds: Option<u64>) -> tarantool::Result<Duration> {
         match timeout_seconds {
-            None => Ok(OPEN_METEO_TIMEOUT),
+            None => Ok(OPEN_METEO_TIMEOUT_DEFAULT),
             Some(seconds) if seconds > 0 => Ok(Duration::from_secs(seconds)),
             Some(_) => Err(BoxError::new(
                 TarantoolErrorCode::IllegalParams,

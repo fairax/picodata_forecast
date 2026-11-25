@@ -1,11 +1,19 @@
+local CACHE_RPC_PROC = 'forecast.rpc_handler'
+
 local function init(opts)
     if not opts.is_master then
         return true
     end
-
+    
     local name = 'forecast.storage_init'
     box.schema.func.create(name, {language = 'C', if_not_exists = true})
-    return box.func[name]:call()
+    box.func[name]:call()
+    box.schema.func.create(CACHE_RPC_PROC, {language = 'C', if_not_exists = true})
+
+    rawset(_G, 'rpc_handler', function(path, ctx, mp_request)
+        return box.func[CACHE_RPC_PROC]:call({path, ctx, mp_request})
+    end)
+    return true
 end
 
 local function stop()

@@ -1,15 +1,53 @@
 use serde_bytes::ByteBuf;
+use shors::transport::rpc::server::Server;
+use shors::transport::{rpc, Context};
+use std::cell::OnceCell;
+use std::ffi::c_int;
+use tarantool::clock;
 use tarantool::error::{BoxError, TarantoolErrorCode};
 use tarantool::index::IndexOptions;
 use tarantool::space::{Field, Space};
+use tarantool::tuple::{FunctionArgs, FunctionCtx};
 
 const CACHE_SPACE: &str = "forecast_cache";
+pub const CACHE_GET_ROUTE: &str = "/forecast/cache/get";
+pub const CACHE_PUT_ROUTE: &str = "/forecast/cache/put";
+
+const CACHE_TTL_SECONDS_DEFAULT: f64 = 60.0;
+
+thread_local! {
+    static CACHE_RPC_SERVER: OnceCell<Server> = const { OnceCell::new() };
+}
+
+fn init_cache_rpc() -> Server {
+    let server = Server::new();
+    let get = rpc::route::Builder::new()
+        .with_path(CACHE_GET_ROUTE)
+        .build(|_: &mut Context, request: rpc::Request| get_cache_entry(request.parse()?));
+    let put = rpc::route::Builder::new().with_path(CACHE_PUT_ROUTE).build(
+        |_: &mut Context, request: rpc::Request| {
+            let (key, bucket_id, body) = request.parse()?;
+            put_cache_entry(key, bucket_id, body)
+        },
+    );
+    server.register(Box::new(get));
+    server.register(Box::new(put));
+    server
+}
+
+#[no_mangle]
+pub extern "C" fn rpc_handler(ctx: FunctionCtx, args: FunctionArgs) -> c_int {
+    CACHE_RPC_SERVER.with(|server| server.get_or_init(init_cache_rpc).handle(ctx, args))
+}
 
 #[tarantool::proc]
 pub fn storage_init() -> tarantool::Result<bool> {
-    tarantool::say_info!("Initializing forecast cache schema");
+    tarantool::say_info!("Initializing forecast cache storage");
     create_schema()?;
-    tarantool::say_info!("Forecast cache schema is ready");
+    CACHE_RPC_SERVER.with(|server| {
+        server.get_or_init(init_cache_rpc);
+    });
+    tarantool::say_info!("Forecast cache schema and RPC routes are ready");
     Ok(true)
 }
 
@@ -20,8 +58,8 @@ fn create_schema() -> tarantool::Result<()> {
             Field::string("key"),
             Field::unsigned("bucket_id"),
             Field::varbinary("body"),
-            Field::unsigned("expires_at"),
-            Field::unsigned("last_access"),
+            Field::double("expires_at"),
+            Field::double("last_access"),
         ])
         .create()?;
 
@@ -72,8 +110,8 @@ pub struct CacheRecord {
     pub key: String,
     pub bucket_id: u64,
     pub body: ByteBuf,
-    pub expires_at: u64,
-    pub last_access: u64,
+    pub expires_at: f64,
+    pub last_access: f64,
 }
 
 fn cache_space() -> tarantool::Result<Space> {
@@ -86,21 +124,25 @@ fn cache_space() -> tarantool::Result<Space> {
     })
 }
 
-pub fn get_cache_entry(key: &str) -> tarantool::Result<Option<CacheRecord>> {
-    let Some(tuple) = cache_space()?.get(&(key,))? else {
+fn get_cache_entry(key: String) -> tarantool::Result<Option<ByteBuf>> {
+    let now = clock::time();
+    let space = cache_space()?;
+    let key = (key,);
+    let Some(tuple) = space.get(&key)? else {
         return Ok(None);
     };
-    Ok(Some(tuple.decode()?))
+    let entry: CacheRecord = tuple.decode()?;
+    if entry.expires_at <= now {
+        space.delete(&key)?;
+        return Ok(None);
+    }
+    space.update(&key, [("=", "last_access", now)])?;
+    Ok(Some(entry.body))
 }
 
-pub fn put_cache_entry(
-    key: String,
-    bucket_id: u64,
-    body: ByteBuf,
-    expires_at: u64,
-    last_access: u64,
-) -> tarantool::Result<()> {
-    cache_space()?.replace(&(key, bucket_id, body, expires_at, last_access))?;
-
-    Ok(())
+fn put_cache_entry(key: String, bucket_id: u64, body: ByteBuf) -> tarantool::Result<bool> {
+    let now = clock::time();
+    let expires_at = now + CACHE_TTL_SECONDS_DEFAULT;
+    cache_space()?.replace(&(key, bucket_id, body, expires_at, now))?;
+    Ok(true)
 }
