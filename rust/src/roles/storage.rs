@@ -5,7 +5,7 @@ use shors::transport::{rpc, Context};
 use std::cell::OnceCell;
 use std::ffi::c_int;
 use tarantool::clock;
-use tarantool::error::{BoxError, Error, TarantoolErrorCode};
+use tarantool::error::{BoxError, TarantoolErrorCode};
 use tarantool::index::IndexOptions;
 use tarantool::space::{Field, Space};
 use tarantool::tuple::{FunctionArgs, FunctionCtx};
@@ -16,6 +16,12 @@ pub const CACHE_PUT_ROUTE: &str = "/forecast/cache/put";
 
 const CACHE_TTL_SECONDS_DEFAULT: f64 = 60.0;
 const MAX_CACHE_ENTRIES_PER_SHARD_DEFAULT: usize = 10_000;
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct Coordinates {
+    pub latitude: f64,
+    pub longitude: f64,
+}
 
 thread_local! {
     static CACHE_RPC_SERVER: OnceCell<Server> = const { OnceCell::new() };
@@ -35,7 +41,9 @@ fn init_cache_rpc() -> Server {
         |_: &mut Context, request: rpc::Request| {
             request
                 .parse()
-                .and_then(|(key, bucket_id, body)| put_cache_entry(key, bucket_id, body))
+                .and_then(|(coordinates, bucket_id, body)| {
+                    put_cache_entry(coordinates, bucket_id, body)
+                })
                 .inspect_err(|error| tarantool::say_error!("Forecast cache write failed: {error}"))
         },
     );
@@ -64,7 +72,8 @@ fn create_schema() -> tarantool::Result<()> {
     let space = Space::builder(CACHE_SPACE)
         .if_not_exists(true)
         .format([
-            Field::string("key"),
+            Field::double("latitude"),
+            Field::double("longitude"),
             Field::unsigned("bucket_id"),
             Field::varbinary("body"),
             Field::double("expires_at"),
@@ -76,7 +85,7 @@ fn create_schema() -> tarantool::Result<()> {
         "primary",
         &IndexOptions {
             if_not_exists: Some(true),
-            parts: Some(vec!["key".into()]),
+            parts: Some(vec!["latitude".into(), "longitude".into()]),
             ..Default::default()
         },
     )?;
@@ -96,7 +105,7 @@ fn create_schema() -> tarantool::Result<()> {
         &IndexOptions {
             unique: Some(false),
             if_not_exists: Some(true),
-            parts: Some(vec!["expires_at".into(), "key".into()]),
+            parts: Some(vec!["expires_at".into()]),
             ..Default::default()
         },
     )?;
@@ -106,7 +115,7 @@ fn create_schema() -> tarantool::Result<()> {
         &IndexOptions {
             unique: Some(false),
             if_not_exists: Some(true),
-            parts: Some(vec!["last_access".into(), "key".into()]),
+            parts: Some(vec!["last_access".into()]),
             ..Default::default()
         },
     )?;
@@ -116,7 +125,8 @@ fn create_schema() -> tarantool::Result<()> {
 
 #[derive(serde::Deserialize)]
 pub struct CacheRecord {
-    pub key: String,
+    pub latitude: f64,
+    pub longitude: f64,
     pub _bucket_id: IgnoredAny,
     pub body: ByteBuf,
     pub expires_at: f64,
@@ -133,10 +143,10 @@ fn cache_space() -> tarantool::Result<Space> {
     })
 }
 
-fn get_cache_entry(key: String) -> tarantool::Result<Option<ByteBuf>> {
+fn get_cache_entry(coordinates: Coordinates) -> tarantool::Result<Option<ByteBuf>> {
     let now = clock::time();
     let space = cache_space()?;
-    let key = (key,);
+    let key = (coordinates.latitude, coordinates.longitude);
     let Some(tuple) = space.get(&key)? else {
         return Ok(None);
     };
@@ -149,7 +159,11 @@ fn get_cache_entry(key: String) -> tarantool::Result<Option<ByteBuf>> {
     Ok(Some(entry.body))
 }
 
-fn put_cache_entry(key: String, bucket_id: u64, body: ByteBuf) -> tarantool::Result<bool> {
+fn put_cache_entry(
+    coordinates: Coordinates,
+    bucket_id: u64,
+    body: ByteBuf,
+) -> tarantool::Result<bool> {
     let now = clock::time();
     let expires_at = now + CACHE_TTL_SECONDS_DEFAULT;
     let space = cache_space()?;
@@ -165,14 +179,22 @@ fn put_cache_entry(key: String, bucket_id: u64, body: ByteBuf) -> tarantool::Res
         };
 
         if let Some(candidate) = candidate {
+            let candidate_key = (candidate.latitude, candidate.longitude);
             // The replacement itself refreshes the eviction candidate when the keys match.
-            if candidate.key != key {
-                space.delete(&(candidate.key,))?;
+            if candidate_key != (coordinates.latitude, coordinates.longitude) {
+                space.delete(&candidate_key)?;
             }
         }
     }
 
-    space.replace(&(key, bucket_id, body, expires_at, now))?;
+    space.replace(&(
+        coordinates.latitude,
+        coordinates.longitude,
+        bucket_id,
+        body,
+        expires_at,
+        now,
+    ))?;
     Ok(true)
 }
 

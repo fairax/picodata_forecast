@@ -1,4 +1,4 @@
-use super::storage::{CACHE_GET_ROUTE, CACHE_PUT_ROUTE};
+use super::storage::{Coordinates, CACHE_GET_ROUTE, CACHE_PUT_ROUTE};
 use serde_bytes::{ByteBuf, Bytes};
 use shors::transport::http::{route::Builder, server::Server, Request, Response};
 use shors::transport::rpc::client;
@@ -54,16 +54,41 @@ pub fn router_init() -> tarantool::Result<bool> {
         .with_path("/forecast")
         .build(
             |_: &mut Context, request: Request| -> Result<Response, Box<dyn Error>> {
-                Ok(fetch_forecast(&request.query))
+                let Some(coordinates) = parse_coordinates(&request.query) else {
+                    return Ok(error_response(
+                        400,
+                        "Expected exactly one latitude and one longitude",
+                    ));
+                };
+                Ok(fetch_forecast(coordinates))
             },
         );
     Server::new().register(Box::new(route));
     Ok(true)
 }
 
-fn fetch_forecast(query: &str) -> Response {
-    let bucket_id = cache_bucket_id(query);
-    if let Some(body) = bucket_id.and_then(|bucket_id| read_cache(bucket_id, query)) {
+fn parse_coordinates(query: &str) -> Option<Coordinates> {
+    let mut latitude = None;
+    let mut longitude = None;
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let coordinate = match name.as_ref() {
+            "latitude" => &mut latitude,
+            "longitude" => &mut longitude,
+            _ => return None,
+        };
+        *coordinate = Some(value.parse::<f64>().ok()?);
+    }
+    Some(Coordinates {
+        latitude: latitude?,
+        longitude: longitude?,
+    })
+}
+
+fn fetch_forecast(coordinates: Coordinates) -> Response {
+    let latitude = coordinates.latitude.to_string();
+    let longitude = coordinates.longitude.to_string();
+    let bucket_id = cache_bucket_id(&format!("{latitude},{longitude}"));
+    if let Some(body) = bucket_id.and_then(|bucket_id| read_cache(bucket_id, coordinates)) {
         return forecast_response(200, body.into_vec());
     }
 
@@ -71,7 +96,9 @@ fn fetch_forecast(query: &str) -> Response {
         let config = config.borrow();
         (config.upstream_url.clone(), config.upstream_timeout)
     });
-    url.set_query((!query.is_empty()).then_some(query));
+    url.query_pairs_mut()
+        .append_pair("latitude", &latitude)
+        .append_pair("longitude", &longitude);
 
     let client = fibreq::ClientBuilder::new().build();
     let result = client.get(url.as_str()).and_then(|request| {
@@ -82,13 +109,13 @@ fn fetch_forecast(query: &str) -> Response {
             .send()?;
         let status = upstream.status();
         if status.is_server_error() {
-            return Ok(gateway_error(502, "Open-Meteo request failed"));
+            return Ok(error_response(502, "Open-Meteo request failed"));
         }
 
         let body = upstream.bytes()?;
         if status.is_success() {
             if let Some(bucket_id) = bucket_id {
-                write_cache(bucket_id, query, &body);
+                write_cache(bucket_id, coordinates, &body);
             }
         }
         let response_status = if status.is_client_error() {
@@ -102,9 +129,9 @@ fn fetch_forecast(query: &str) -> Response {
     match result {
         Ok(response) => response,
         Err(err) if matches!(*err, fibreq::Error::Timeout) => {
-            gateway_error(504, "Open-Meteo request timed out")
+            error_response(504, "Open-Meteo request timed out")
         }
-        _ => gateway_error(502, "Open-Meteo request failed"),
+        _ => error_response(502, "Open-Meteo request failed"),
     }
 }
 
@@ -117,23 +144,23 @@ fn cache_bucket_id(key: &str) -> Option<i64> {
         .ok()
 }
 
-fn read_cache(bucket_id: i64, key: &str) -> Option<ByteBuf> {
+fn read_cache(bucket_id: i64, coordinates: Coordinates) -> Option<ByteBuf> {
     let lua = tarantool::lua_state();
     let response = client::Builder::new(&lua)
         .shard_endpoint(CACHE_GET_ROUTE)
-        .call(&mut Context::background(), bucket_id, key)
+        .call(&mut Context::background(), bucket_id, coordinates)
         .ok()?;
     response.decode::<(Option<ByteBuf>,)>().ok()?.0
 }
 
-fn write_cache(bucket_id: i64, key: &str, body: &[u8]) {
+fn write_cache(bucket_id: i64, coordinates: Coordinates, body: &[u8]) {
     let lua = tarantool::lua_state();
     let _ = client::Builder::new(&lua)
         .shard_endpoint(CACHE_PUT_ROUTE)
         .call(
             &mut Context::background(),
             bucket_id,
-            (key, bucket_id, Bytes::new(body)),
+            (coordinates, bucket_id, Bytes::new(body)),
         );
 }
 
@@ -145,7 +172,7 @@ fn forecast_response(status: u32, body: Vec<u8>) -> Response {
     }
 }
 
-fn gateway_error(status: u32, message: &str) -> Response {
+fn error_response(status: u32, message: &str) -> Response {
     Response {
         status,
         headers: [("content-type".into(), "text/plain; charset=utf-8".into())].into(),
@@ -171,11 +198,13 @@ impl ForecastSettings {
     fn parse_upstream_url(upstream_url: Option<&str>) -> tarantool::Result<Url> {
         Url::parse(upstream_url.unwrap_or(OPEN_METEO_FORECAST_URL_DEFAULT))
             .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https") && url.has_host())
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https") && url.has_host() && url.query().is_none()
+            })
             .ok_or_else(|| {
                 BoxError::new(
                     TarantoolErrorCode::IllegalParams,
-                    "forecast_router.upstream_url must be an HTTP(S) URL with a host",
+                    "forecast_router.upstream_url must be an HTTP(S) URL with a host and no query string",
                 )
                 .into()
             })
