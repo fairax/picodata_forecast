@@ -1,0 +1,3 @@
+forecast_router:
+  upstream_url: https://127.0.0.1:8443/v1/forecast
+  upstream_timeout_seconds: 10

@@ -1,5 +1,10 @@
 #!/bin/sh
 
+set -e
+
+cargo build --release --locked --manifest-path rust/Cargo.toml --target-dir rust/target
+cp rust/target/release/libforecast.so forecast.so
+
 # Simple pre-build script
 # Will be ran before "tarantoolctl rocks make" on application build
 # Could be useful to install non-standart rocks modules
