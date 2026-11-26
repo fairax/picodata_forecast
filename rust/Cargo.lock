@@ -735,6 +735,7 @@ dependencies = [
  "native-tls",
  "serde",
  "serde_bytes",
+ "serde_json",
  "shors",
  "tarantool",
  "url",
