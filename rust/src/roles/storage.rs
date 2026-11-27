@@ -2,13 +2,13 @@ use serde::de::IgnoredAny;
 use serde_bytes::ByteBuf;
 use shors::transport::rpc::server::Server;
 use shors::transport::{rpc, Context};
-use std::cell::OnceCell;
+use std::cell::{OnceCell, RefCell};
 use std::ffi::c_int;
 use tarantool::clock;
 use tarantool::error::{BoxError, TarantoolErrorCode};
 use tarantool::index::IndexOptions;
 use tarantool::space::{Field, Space};
-use tarantool::tuple::{FunctionArgs, FunctionCtx};
+use tarantool::tuple::{FunctionArgs, FunctionCtx, Tuple};
 
 const CACHE_SPACE: &str = "forecast_cache";
 pub const CACHE_GET_ROUTE: &str = "/forecast/cache/get";
@@ -16,6 +16,17 @@ pub const CACHE_PUT_ROUTE: &str = "/forecast/cache/put";
 
 const CACHE_TTL_SECONDS_DEFAULT: f64 = 60.0;
 const MAX_CACHE_ENTRIES_PER_SHARD_DEFAULT: usize = 10_000;
+
+#[derive(Clone, Copy)]
+struct StorageConfig {
+    cache_ttl_seconds: f64,
+    max_cache_entries_per_shard: usize,
+}
+
+const STORAGE_CONFIG_DEFAULT: StorageConfig = StorageConfig {
+    cache_ttl_seconds: CACHE_TTL_SECONDS_DEFAULT,
+    max_cache_entries_per_shard: MAX_CACHE_ENTRIES_PER_SHARD_DEFAULT,
+};
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Coordinates {
@@ -25,6 +36,23 @@ pub struct Coordinates {
 
 thread_local! {
     static CACHE_RPC_SERVER: OnceCell<Server> = const { OnceCell::new() };
+    // Copy the settings before any operation that can yield so another fiber can apply config.
+    static STORAGE_CONFIG: RefCell<StorageConfig> = const { RefCell::new(STORAGE_CONFIG_DEFAULT) };
+}
+
+#[tarantool::proc]
+fn storage_validate_config(settings: Option<StorageSettings>) -> tarantool::Result<Tuple> {
+    settings.unwrap_or_default().resolve()?;
+    // Work around the pre-box.cfg() return-port crash by returning a Tuple.
+    Tuple::new(&(true,))
+}
+
+#[tarantool::proc]
+fn storage_apply_config(settings: Option<StorageSettings>) -> tarantool::Result<bool> {
+    let config = settings.unwrap_or_default().resolve()?;
+    STORAGE_CONFIG.with(|current| current.replace(config));
+    tarantool::say_info!("Forecast storage configuration loaded");
+    Ok(true)
 }
 
 fn init_cache_rpc() -> Server {
@@ -164,12 +192,13 @@ fn put_cache_entry(
     bucket_id: u64,
     body: ByteBuf,
 ) -> tarantool::Result<bool> {
+    let config = STORAGE_CONFIG.with(|current| *current.borrow());
     let now = clock::time();
-    let expires_at = now + CACHE_TTL_SECONDS_DEFAULT;
+    let expires_at = now + config.cache_ttl_seconds;
     let space = cache_space()?;
 
     let count = space.len()?;
-    let needs_eviction = count >= MAX_CACHE_ENTRIES_PER_SHARD_DEFAULT;
+    let needs_eviction = count >= config.max_cache_entries_per_shard;
 
     if needs_eviction {
         // Reclaim an expired entry before evicting a forecast that can still be served.
@@ -206,4 +235,40 @@ fn oldest_cache_entry(space: &Space, index_name: &str) -> tarantool::Result<Opti
         )
     })?;
     index.min(&())?.map(|tuple| tuple.decode()).transpose()
+}
+
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct StorageSettings {
+    cache_ttl_seconds: Option<f64>,
+    max_cache_entries_per_shard: Option<usize>,
+}
+
+impl StorageSettings {
+    fn resolve(self) -> tarantool::Result<StorageConfig> {
+        let cache_ttl_seconds = self.cache_ttl_seconds.unwrap_or(CACHE_TTL_SECONDS_DEFAULT);
+        if !cache_ttl_seconds.is_finite() || cache_ttl_seconds <= 0.0 {
+            return Err(BoxError::new(
+                TarantoolErrorCode::IllegalParams,
+                "forecast_storage.cache_ttl_seconds must be a finite positive number",
+            )
+            .into());
+        }
+
+        let max_cache_entries_per_shard = self
+            .max_cache_entries_per_shard
+            .unwrap_or(MAX_CACHE_ENTRIES_PER_SHARD_DEFAULT);
+        if max_cache_entries_per_shard == 0 {
+            return Err(BoxError::new(
+                TarantoolErrorCode::IllegalParams,
+                "forecast_storage.max_cache_entries_per_shard must be a positive integer",
+            )
+            .into());
+        }
+
+        Ok(StorageConfig {
+            cache_ttl_seconds,
+            max_cache_entries_per_shard,
+        })
+    }
 }
